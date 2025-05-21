@@ -7,7 +7,7 @@ import (
 	"github.com/Souvik-223/rhino-framework/p2p"
 )
 
-func onPeer(Peer p2p.Peer) error {
+func OnPeer(Peer p2p.Peer) error {
 	Peer.Close()
 	return nil
 }
@@ -17,7 +17,7 @@ func main() {
 		ListenAddr:    ":3000",
 		HandshakeFunc: p2p.NOPHandshakeFunc,
 		Decoder:       p2p.DefaultDecoder{},
-		onPeer:        onPeer,
+		OnPeer:        OnPeer,
 	}
 	tr := p2p.NewTCPTransport(tcpOps)
 
