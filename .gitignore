@@ -1,0 +1,10 @@
+# Agentic and AI files
+CLAUDE.md
+AGENTS.md
+
+# agents and skill files
+.claude
+.agent
+
+# plan files for code implementations
+/tasks

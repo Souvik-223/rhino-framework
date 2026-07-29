@@ -1,8 +1,9 @@
-package main
+package storage
 
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"testing"
 )
@@ -23,7 +24,7 @@ func TestPathTransformFunc(t *testing.T) {
 
 func TestStore(t *testing.T) {
 	s := newStore()
-	id := generateID()
+	id := GenerateID()
 	defer teardown(t, s)
 
 	for i := 0; i < 50; i++ {
@@ -46,6 +47,10 @@ func TestStore(t *testing.T) {
 		b, _ := ioutil.ReadAll(r)
 		if string(b) != string(data) {
 			t.Errorf("want %s have %s", data, b)
+		}
+
+		if rc, ok := r.(io.Closer); ok {
+			rc.Close()
 		}
 
 		if err := s.Delete(id, key); err != nil {

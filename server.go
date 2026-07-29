@@ -11,13 +11,14 @@ import (
 	"time"
 
 	"github.com/Souvik-223/rhino-framework/p2p"
+	"github.com/Souvik-223/rhino-framework/storage"
 )
 
 type FileServerOpts struct {
 	ID                string
 	EncKey            []byte
 	StorageRoot       string
-	PathTransformFunc PathTransformFunc
+	PathTransformFunc storage.PathTransformFunc
 	Transport         p2p.Transport
 	BootstrapNodes    []string
 }
@@ -28,23 +29,23 @@ type FileServer struct {
 	peerLock sync.Mutex
 	peers    map[string]p2p.Peer
 
-	store  *Store
+	store  *storage.Store
 	quitch chan struct{}
 }
 
 func NewFileServer(opts FileServerOpts) *FileServer {
-	storeOpts := StoreOpts{
+	storeOpts := storage.StoreOpts{
 		Root:              opts.StorageRoot,
 		PathTransformFunc: opts.PathTransformFunc,
 	}
 
 	if len(opts.ID) == 0 {
-		opts.ID = generateID()
+		opts.ID = storage.GenerateID()
 	}
 
 	return &FileServer{
 		FileServerOpts: opts,
-		store:          NewStore(storeOpts),
+		store:          storage.NewStore(storeOpts),
 		quitch:         make(chan struct{}),
 		peers:          make(map[string]p2p.Peer),
 	}
@@ -93,7 +94,7 @@ func (s *FileServer) Get(key string) (io.Reader, error) {
 	msg := Message{
 		Payload: MessageGetFile{
 			ID:  s.ID,
-			Key: hashKey(key),
+			Key: storage.HashKey(key),
 		},
 	}
 
@@ -137,7 +138,7 @@ func (s *FileServer) Store(key string, r io.Reader) error {
 	msg := Message{
 		Payload: MessageStoreFile{
 			ID:   s.ID,
-			Key:  hashKey(key),
+			Key:  storage.HashKey(key),
 			Size: size + 16,
 		},
 	}
@@ -154,7 +155,7 @@ func (s *FileServer) Store(key string, r io.Reader) error {
 	}
 	mw := io.MultiWriter(peers...)
 	mw.Write([]byte{p2p.IncomingStream})
-	n, err := copyEncrypt(s.EncKey, fileBuffer, mw)
+	n, err := storage.CopyEncrypt(s.EncKey, fileBuffer, mw)
 	if err != nil {
 		return err
 	}

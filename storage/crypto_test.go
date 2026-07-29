@@ -1,4 +1,4 @@
-package main
+package storage
 
 import (
 	"bytes"
@@ -10,8 +10,8 @@ func TestCopyEncryptDecrypt(t *testing.T) {
 	payload := "Foo not bar"
 	src := bytes.NewReader([]byte(payload))
 	dst := new(bytes.Buffer)
-	key := newEncryptionKey()
-	_, err := copyEncrypt(key, src, dst)
+	key := NewEncryptionKey()
+	_, err := CopyEncrypt(key, src, dst)
 	if err != nil {
 		t.Error(err)
 	}
@@ -20,7 +20,7 @@ func TestCopyEncryptDecrypt(t *testing.T) {
 	fmt.Println(len(dst.String()))
 
 	out := new(bytes.Buffer)
-	nw, err := copyDecrypt(key, dst, out)
+	nw, err := CopyDecrypt(key, dst, out)
 	if err != nil {
 		t.Error(err)
 	}
