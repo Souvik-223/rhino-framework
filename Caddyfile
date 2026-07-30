@@ -1,0 +1,6 @@
+# Terminates TLS automatically (Let's Encrypt) and reverse-proxies to the
+# rhino container — keeps the Go server itself simple (see
+# plans/web_portal.md §8.1). Replace the placeholder domain before use.
+portal.example.com {
+    reverse_proxy rhino:8080
+}

@@ -4,3 +4,23 @@
 
 # plan files for code implementations
 /tasks
+/plans
+
+# web portal — frontend build tooling/output
+frontend/node_modules/
+frontend/dist/
+
+# backend/dist/ is what go:embed reads; everything in it except the
+# checked-in placeholder index.html is real Vite build output copied in by
+# `make build-frontend`, not source — see plans/web_portal.md §3.
+backend/dist/*
+!backend/dist/index.html
+
+# local secrets — never commit these (see .env.example)
+.env
+secrets/
+
+# note: bin/fs and bin/rhino are already tracked without a bin/ entry here
+# (pre-existing repo state) — see plans/web_portal.md §8.6 for why that's
+# flagged as worth revisiting once CI/Docker is the real build path,
+# rather than something changed silently as part of this feature.

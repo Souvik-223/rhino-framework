@@ -3,6 +3,7 @@ package drivepool
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -15,10 +16,12 @@ import (
 // fakeStore is an in-memory RemoteStore so pool/placement logic can be
 // tested without any real Drive account or network access.
 type fakeStore struct {
-	limit int64
-	usage int64
-	files map[string][]byte // remoteFileID -> ciphertext
-	next  int
+	limit      int64
+	usage      int64
+	files      map[string][]byte // remoteFileID -> ciphertext
+	next       int
+	failUpload bool // if true, Upload always errors — used to test partial-failure cleanup
+	deleted    []string
 }
 
 func newFakeStore(limit, usage int64) *fakeStore {
@@ -30,6 +33,9 @@ func (f *fakeStore) EnsureFolder(ctx context.Context, name string) (string, erro
 }
 
 func (f *fakeStore) Upload(ctx context.Context, name, folderID string, r io.ReaderAt, size int64) (string, string, error) {
+	if f.failUpload {
+		return "", "", fmt.Errorf("fakeStore: simulated upload failure")
+	}
 	buf := make([]byte, size)
 	if _, err := r.ReadAt(buf, 0); err != nil && err != io.EOF {
 		return "", "", err
@@ -51,6 +57,7 @@ func (f *fakeStore) Download(ctx context.Context, remoteFileID string) (io.ReadC
 
 func (f *fakeStore) Delete(ctx context.Context, remoteFileID string) error {
 	delete(f.files, remoteFileID)
+	f.deleted = append(f.deleted, remoteFileID)
 	return nil
 }
 

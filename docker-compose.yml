@@ -1,0 +1,36 @@
+services:
+  rhino:
+    build: .
+    environment:
+      - RHINO_DATA_DIR=/data
+      - RHINO_ADDR=:8080
+      - RHINO_SESSION_SECRET_FILE=/run/secrets/session_secret
+    volumes:
+      - rhino-data:/data
+      # client_secret.json is the Google OAuth app credential, shared by
+      # every user of this deployment — bind-mounted read-only rather than
+      # baked into the image or committed to the repo.
+      - ./secrets/client_secret.json:/data/client_secret.json:ro
+    secrets:
+      - session_secret
+    ports:
+      - "127.0.0.1:8080:8080" # Caddy is the only thing that should be reachable externally
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy-data:/data
+    depends_on:
+      - rhino
+
+volumes:
+  rhino-data:
+  caddy-data:
+
+secrets:
+  session_secret:
+    file: ./secrets/session_secret.txt

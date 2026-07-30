@@ -12,9 +12,7 @@ import (
 	"path/filepath"
 
 	"github.com/Souvik-223/rhino-framework/drivepool"
-	"github.com/Souvik-223/rhino-framework/drivepool/auth"
 	"github.com/Souvik-223/rhino-framework/drivepool/gdrive"
-	"github.com/Souvik-223/rhino-framework/drivepool/manifest"
 	"github.com/spf13/cobra"
 )
 
@@ -30,7 +28,7 @@ func main() {
 	root.PersistentFlags().StringVar(&credentialsPath, "credentials", "",
 		"path to the OAuth client_secret.json (default: <config dir>/rhino/client_secret.json)")
 
-	root.AddCommand(newAccountCmd(), newPutCmd(), newGetCmd(), newLsCmd(), newRmCmd(), newStatusCmd())
+	root.AddCommand(newAccountCmd(), newPutCmd(), newGetCmd(), newLsCmd(), newRmCmd(), newStatusCmd(), newServeCmd())
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -38,12 +36,13 @@ func main() {
 	}
 }
 
+// configDir resolves where the CLI's manifest, tokens, and OAuth client
+// config live. RHINO_DATA_DIR overrides the default so the same resolution
+// logic works unchanged inside a container (see backend/config.go, which
+// resolves one such directory per portal user instead of this one shared
+// local directory).
 func configDir() (string, error) {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return "", fmt.Errorf("resolve config dir: %w", err)
-	}
-	return filepath.Join(dir, "rhino"), nil
+	return drivepool.ResolveDataDir(os.Getenv("RHINO_DATA_DIR"))
 }
 
 // openPool wires up the manifest, token store, and OAuth client config,
@@ -54,31 +53,9 @@ func openPool(ctx context.Context) (*drivepool.Pool, error) {
 		return nil, err
 	}
 
-	manifestPath, err := manifest.Path()
+	pool, err := drivepool.OpenFromDataDir(ctx, cfgDir, credentialsPath, gdrive.DriveFileScope)
 	if err != nil {
-		return nil, err
-	}
-	m, err := manifest.Open(manifestPath)
-	if err != nil {
-		return nil, fmt.Errorf("open manifest: %w", err)
-	}
-
-	tokens := auth.NewTokenStore(filepath.Join(cfgDir, "accounts"))
-
-	secretPath := credentialsPath
-	if secretPath == "" {
-		secretPath = filepath.Join(cfgDir, "client_secret.json")
-	}
-	clientCfg, err := auth.LoadClientConfig(secretPath, gdrive.DriveFileScope)
-	if err != nil {
-		m.Close()
-		return nil, fmt.Errorf("load OAuth client config from %s (see README's one-time setup steps): %w", secretPath, err)
-	}
-
-	pool, err := drivepool.Open(ctx, m, tokens, clientCfg)
-	if err != nil {
-		m.Close()
-		return nil, err
+		return nil, fmt.Errorf("%w (see README's one-time setup steps)", err)
 	}
 	return pool, nil
 }

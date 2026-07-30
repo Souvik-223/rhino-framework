@@ -1,22 +1,22 @@
 // Package drivepool pools multiple Google Drive accounts into one virtual
 // storage volume: registered accounts are placement candidates, files are
-// encrypted and uploaded to whichever account currently has the most free
-// space, and a local SQLite manifest maps virtual file names back to the
-// remote chunks that hold their bytes.
-//
-// Splitting large files into many chunks spread across accounts (rather
-// than the current one-chunk-per-file behavior) is tracked as future work —
-// see tasks/modification_plan.md, Phase 3.
+// encrypted, split into fixed-size chunks, and each chunk is uploaded to
+// whichever account currently has the most free space, and a local SQLite
+// manifest maps virtual file names back to the remote chunks that hold
+// their bytes.
 package drivepool
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/Souvik-223/rhino-framework/drivepool/auth"
@@ -25,6 +25,12 @@ import (
 	"github.com/Souvik-223/rhino-framework/storage"
 	"golang.org/x/oauth2"
 )
+
+// DefaultChunkSize is used when Pool.ChunkSize is unset (zero).
+const DefaultChunkSize = 128 << 20 // 128 MiB
+
+// defaultMaxParallelUploads is used when Pool.MaxParallelUploads is unset.
+const defaultMaxParallelUploads = 4
 
 // Account is a registered Drive account: a placement candidate for Put and
 // the source for Get. initErr is set when the account's client couldn't be
@@ -48,6 +54,25 @@ type Pool struct {
 	newClient func(ctx context.Context, ts oauth2.TokenSource) (gdrive.RemoteStore, error)
 
 	accounts map[string]*Account // keyed by manifest Account.ID
+
+	// ChunkSize and MaxParallelUploads tune PutStream/GetStream; zero means
+	// "use the default" (DefaultChunkSize / defaultMaxParallelUploads).
+	ChunkSize          int64
+	MaxParallelUploads int
+}
+
+func (p *Pool) chunkSize() int64 {
+	if p.ChunkSize > 0 {
+		return p.ChunkSize
+	}
+	return DefaultChunkSize
+}
+
+func (p *Pool) maxParallelUploads() int {
+	if p.MaxParallelUploads > 0 {
+		return p.MaxParallelUploads
+	}
+	return defaultMaxParallelUploads
 }
 
 // Open loads every account already registered in m and builds a Drive
@@ -202,103 +227,285 @@ func (p *Pool) ListAccountStatus(ctx context.Context) ([]AccountStatus, error) {
 	return out, nil
 }
 
-// Put encrypts localPath and uploads it to whichever registered account
-// currently has the most free space, recording the result as a single-chunk
-// virtual file named virtualName.
+// Put encrypts localPath and uploads it, split into one or more chunks
+// spread across whichever registered accounts have the most free space,
+// recording the result as a virtual file. It is a thin wrapper around
+// PutStream so the CLI's on-disk-file use case needs no changes.
 func (p *Pool) Put(ctx context.Context, localPath, virtualName string) error {
-	src, err := os.Open(localPath)
+	f, err := os.Open(localPath)
 	if err != nil {
 		return fmt.Errorf("drivepool: open %q: %w", localPath, err)
 	}
-	defer src.Close()
+	defer f.Close()
 
-	info, err := src.Stat()
+	info, err := f.Stat()
 	if err != nil {
 		return fmt.Errorf("drivepool: stat %q: %w", localPath, err)
 	}
 
-	staged, err := os.CreateTemp("", "rhino-chunk-*")
+	return p.PutStream(ctx, f, info.Size(), virtualName)
+}
+
+// uploadedChunk is the bookkeeping produced by uploadChunk for one
+// successfully uploaded chunk, recorded into the manifest once every
+// chunk in a PutStream call has finished.
+type uploadedChunk struct {
+	index           int
+	accountID       string
+	remoteFileID    string
+	remoteFolderID  string
+	plaintextSize   int64
+	plaintextSHA256 string
+	ciphertextMD5   string
+}
+
+// folderResolver ensures EnsureFolder is called at most once per account
+// per PutStream call. Without this, two chunks concurrently placed on the
+// same account could each see "no existing folder" and both create one,
+// leaving duplicate same-named folders on that account.
+type folderResolver struct {
+	mu      sync.Mutex
+	folders map[string]string // accountID -> folderID
+}
+
+func newFolderResolver() *folderResolver {
+	return &folderResolver{folders: make(map[string]string)}
+}
+
+func (fr *folderResolver) resolve(ctx context.Context, acc *Account, name string) (string, error) {
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+	if id, ok := fr.folders[acc.ID]; ok {
+		return id, nil
+	}
+	id, err := acc.Store.EnsureFolder(ctx, name)
 	if err != nil {
-		return fmt.Errorf("drivepool: create staging file: %w", err)
+		return "", err
 	}
-	stagedPath := staged.Name()
-	defer os.Remove(stagedPath)
-	defer staged.Close()
+	fr.folders[acc.ID] = id
+	return id, nil
+}
 
-	fileKey := storage.NewEncryptionKey()
-	sha := sha256.New()
-	md := md5.New()
-
-	teedSrc := io.TeeReader(src, sha)
-	ciphertextWriter := io.MultiWriter(staged, md)
-	if _, err := storage.CopyEncrypt(fileKey, teedSrc, ciphertextWriter); err != nil {
-		return fmt.Errorf("drivepool: encrypt: %w", err)
+// PutStream reads size bytes from r (the caller must ensure r yields
+// exactly size bytes — the same contract gdrive.RemoteStore.Upload already
+// has), splits them into chunkSize()-sized pieces, encrypts each chunk in
+// memory (never staged to local disk), places it on whichever account has
+// room via a placementTracker, and uploads chunks concurrently (bounded by
+// maxParallelUploads()). This is what the web backend calls directly with
+// an HTTP request body; Put wraps it for the CLI's local-file use case.
+func (p *Pool) PutStream(ctx context.Context, r io.Reader, size int64, virtualName string) error {
+	chunkSize := p.chunkSize()
+	numChunks := 1
+	if size > 0 {
+		numChunks = int((size + chunkSize - 1) / chunkSize)
 	}
-
-	stagedInfo, err := staged.Stat()
-	if err != nil {
-		return fmt.Errorf("drivepool: stat staged chunk: %w", err)
-	}
-	contentHash := hex.EncodeToString(sha.Sum(nil))
-	localCiphertextMD5 := hex.EncodeToString(md.Sum(nil))
 
 	candidates := make([]*Account, 0, len(p.accounts))
 	for _, a := range p.accounts {
 		candidates = append(candidates, a)
 	}
-	target, err := pickAccount(ctx, candidates)
-	if err != nil {
-		return err
+
+	var singleAccount *Account
+	var tracker *placementTracker
+	if numChunks == 1 {
+		acc, err := pickAccount(ctx, candidates)
+		if err != nil {
+			return err
+		}
+		singleAccount = acc
+	} else {
+		t, err := newPlacementTracker(ctx, candidates)
+		if err != nil {
+			return err
+		}
+		tracker = t
 	}
 
-	folderID, err := target.Store.EnsureFolder(ctx, contentHash)
-	if err != nil {
-		return fmt.Errorf("drivepool: ensure remote folder: %w", err)
+	fileKey := storage.NewEncryptionKey()
+	fileID := storage.GenerateID()
+	folders := newFolderResolver()
+
+	fileHash := sha256.New()
+	sem := make(chan struct{}, p.maxParallelUploads())
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+	results := make([]*uploadedChunk, numChunks)
+
+	remaining := size
+	var readErr error
+	for idx := 0; idx < numChunks; idx++ {
+		n := chunkSize
+		if remaining < n {
+			n = remaining
+		}
+		buf := make([]byte, n)
+		if n > 0 {
+			if _, err := io.ReadFull(r, buf); err != nil {
+				readErr = fmt.Errorf("drivepool: read chunk %d: %w", idx, err)
+				break
+			}
+		}
+		remaining -= n
+		fileHash.Write(buf)
+
+		acc := singleAccount
+		if tracker != nil {
+			accountID, err := tracker.reserve(n)
+			if err != nil {
+				readErr = err
+				break
+			}
+			acc = p.accounts[accountID]
+		}
+
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(idx int, plaintext []byte, acc *Account) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			uc, err := p.uploadChunk(ctx, acc, folders, fileID, fileKey, idx, plaintext)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				return
+			}
+			results[idx] = uc
+		}(idx, buf, acc)
+	}
+	wg.Wait()
+
+	uploaded := make([]*uploadedChunk, 0, numChunks)
+	for _, uc := range results {
+		if uc != nil {
+			uploaded = append(uploaded, uc)
+		}
 	}
 
-	if _, err := staged.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("drivepool: rewind staged chunk: %w", err)
+	if readErr != nil {
+		p.cleanupChunks(ctx, uploaded)
+		return readErr
 	}
-	remoteFileID, remoteMD5, err := target.Store.Upload(ctx, contentHash, folderID, staged, stagedInfo.Size())
-	if err != nil {
-		return fmt.Errorf("drivepool: upload: %w", err)
-	}
-	if remoteMD5 != "" && remoteMD5 != localCiphertextMD5 {
-		return fmt.Errorf("drivepool: upload integrity check failed: local md5 %s != remote md5 %s", localCiphertextMD5, remoteMD5)
+	if firstErr != nil {
+		p.cleanupChunks(ctx, uploaded)
+		return firstErr
 	}
 
+	contentHash := hex.EncodeToString(fileHash.Sum(nil))
 	vf := &manifest.VirtualFile{
 		Name:        virtualName,
-		Size:        info.Size(),
+		Size:        size,
 		ContentHash: contentHash,
-		ChunkSize:   info.Size(),
+		ChunkSize:   chunkSize,
 		FileKey:     fileKey,
 		Status:      manifest.StatusIncomplete,
 	}
 	if err := p.manifest.CreateVirtualFile(ctx, vf); err != nil {
+		p.cleanupChunks(ctx, uploaded)
 		return fmt.Errorf("drivepool: record virtual file: %w", err)
 	}
 
-	if err := p.manifest.AddChunk(ctx, &manifest.Chunk{
-		VirtualFileID:   vf.ID,
-		Index:           0,
-		AccountID:       target.ID,
-		RemoteFileID:    remoteFileID,
-		RemoteFolderID:  folderID,
-		PlaintextSize:   info.Size(),
-		PlaintextSHA256: contentHash,
-		CiphertextMD5:   localCiphertextMD5,
-	}); err != nil {
-		return fmt.Errorf("drivepool: record chunk: %w", err)
+	for _, uc := range uploaded {
+		if err := p.manifest.AddChunk(ctx, &manifest.Chunk{
+			VirtualFileID:   vf.ID,
+			Index:           uc.index,
+			AccountID:       uc.accountID,
+			RemoteFileID:    uc.remoteFileID,
+			RemoteFolderID:  uc.remoteFolderID,
+			PlaintextSize:   uc.plaintextSize,
+			PlaintextSHA256: uc.plaintextSHA256,
+			CiphertextMD5:   uc.ciphertextMD5,
+		}); err != nil {
+			return fmt.Errorf("drivepool: record chunk %d: %w", uc.index, err)
+		}
 	}
 
 	return p.manifest.SetVirtualFileStatus(ctx, vf.ID, manifest.StatusComplete)
 }
 
-// Get downloads virtualName's chunks (currently always exactly one),
-// decrypts them, verifies the plaintext against the recorded content hash,
-// and writes the result to destPath.
+// uploadChunk encrypts one chunk's plaintext entirely in memory (no local
+// temp file) and uploads it to acc. The resulting *bytes.Reader satisfies
+// the same io.ReaderAt gdrive.RemoteStore.Upload already requires for
+// Drive's resumable upload (so a failed chunk can be re-read and retried),
+// so this needs zero changes to the RemoteStore interface.
+func (p *Pool) uploadChunk(ctx context.Context, acc *Account, folders *folderResolver, fileID string, fileKey []byte, idx int, plaintext []byte) (*uploadedChunk, error) {
+	var ciphertext bytes.Buffer
+	md := md5.New()
+	if _, err := storage.CopyEncrypt(fileKey, bytes.NewReader(plaintext), io.MultiWriter(&ciphertext, md)); err != nil {
+		return nil, fmt.Errorf("drivepool: encrypt chunk %d: %w", idx, err)
+	}
+	plaintextSum := sha256.Sum256(plaintext)
+	plaintextHash := hex.EncodeToString(plaintextSum[:])
+	ciphertextMD5 := hex.EncodeToString(md.Sum(nil))
+
+	folderID, err := folders.resolve(ctx, acc, fileID)
+	if err != nil {
+		return nil, fmt.Errorf("drivepool: ensure remote folder for chunk %d: %w", idx, err)
+	}
+
+	remoteName := fmt.Sprintf("chunk-%04d", idx)
+	remoteFileID, remoteMD5, err := acc.Store.Upload(ctx, remoteName, folderID, bytes.NewReader(ciphertext.Bytes()), int64(ciphertext.Len()))
+	if err != nil {
+		return nil, fmt.Errorf("drivepool: upload chunk %d: %w", idx, err)
+	}
+	if remoteMD5 != "" && remoteMD5 != ciphertextMD5 {
+		return nil, fmt.Errorf("drivepool: chunk %d integrity check failed: local md5 %s != remote md5 %s", idx, ciphertextMD5, remoteMD5)
+	}
+
+	return &uploadedChunk{
+		index:           idx,
+		accountID:       acc.ID,
+		remoteFileID:    remoteFileID,
+		remoteFolderID:  folderID,
+		plaintextSize:   int64(len(plaintext)),
+		plaintextSHA256: plaintextHash,
+		ciphertextMD5:   ciphertextMD5,
+	}, nil
+}
+
+// cleanupChunks best-effort deletes chunks that were already uploaded when
+// a later chunk in the same Put failed, so a partial failure doesn't leave
+// orphaned ciphertext on some accounts with no manifest row pointing to
+// it. A cleanup failure is logged, not returned — it must never mask the
+// original error.
+func (p *Pool) cleanupChunks(ctx context.Context, chunks []*uploadedChunk) {
+	for _, c := range chunks {
+		acc, ok := p.accounts[c.accountID]
+		if !ok || acc.initErr != nil {
+			continue
+		}
+		if err := acc.Store.Delete(ctx, c.remoteFileID); err != nil {
+			log.Printf("drivepool: cleanup: failed to delete orphaned chunk %d (%s): %v", c.index, c.remoteFileID, err)
+		}
+	}
+}
+
+// Get downloads virtualName's chunks, decrypts them, verifies the
+// plaintext against the recorded content hash, and writes the result to
+// destPath. It is a thin wrapper around GetStream so the CLI's
+// write-to-a-local-file use case needs no changes.
 func (p *Pool) Get(ctx context.Context, virtualName, destPath string) error {
+	dst, err := os.Create(destPath)
+	if err != nil {
+		return fmt.Errorf("drivepool: create %q: %w", destPath, err)
+	}
+	defer dst.Close()
+
+	return p.GetStream(ctx, virtualName, dst)
+}
+
+// GetStream downloads and decrypts virtualName's chunks and writes the
+// plaintext to w in order. w is a plain io.Writer (not io.WriterAt) so
+// this can stream straight to an HTTP response, which has no seek — so
+// chunks are fetched+decrypted concurrently but emitted strictly in
+// order: a slice of one buffered channel per chunk index lets goroutines
+// finish out of order while the single writer below drains channel 0,
+// then 1, then 2, ...
+func (p *Pool) GetStream(ctx context.Context, virtualName string, w io.Writer) error {
 	vf, err := p.manifest.GetVirtualFile(ctx, virtualName)
 	if err != nil {
 		return err
@@ -312,36 +519,90 @@ func (p *Pool) Get(ctx context.Context, virtualName, destPath string) error {
 		return fmt.Errorf("drivepool: %q has no recorded chunks", virtualName)
 	}
 
-	dst, err := os.Create(destPath)
-	if err != nil {
-		return fmt.Errorf("drivepool: create %q: %w", destPath, err)
-	}
-	defer dst.Close()
-
-	sha := sha256.New()
-
-	for _, chunk := range chunks {
-		a, ok := p.accounts[chunk.AccountID]
-		if !ok || a.initErr != nil {
-			return fmt.Errorf("drivepool: chunk %d's account is unavailable", chunk.Index)
-		}
-
-		rc, err := a.Store.Download(ctx, chunk.RemoteFileID)
-		if err != nil {
-			return fmt.Errorf("drivepool: download chunk %d: %w", chunk.Index, err)
-		}
-
-		_, err = storage.CopyDecrypt(vf.FileKey, rc, io.MultiWriter(dst, sha))
-		rc.Close()
-		if err != nil {
-			return fmt.Errorf("drivepool: decrypt chunk %d: %w", chunk.Index, err)
-		}
+	ready := make([]chan []byte, len(chunks))
+	for i := range ready {
+		ready[i] = make(chan []byte, 1)
 	}
 
-	if got := hex.EncodeToString(sha.Sum(nil)); got != vf.ContentHash {
+	sem := make(chan struct{}, p.maxParallelUploads())
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var firstErr error
+
+	for i, chunk := range chunks {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, chunk manifest.Chunk) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			plaintext, err := p.downloadChunk(ctx, vf.FileKey, chunk)
+			if err != nil {
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				mu.Unlock()
+				close(ready[i])
+				return
+			}
+			ready[i] <- plaintext
+		}(i, chunk)
+	}
+
+	fileHash := sha256.New()
+	var writeErr error
+	for i := range chunks {
+		plaintext, ok := <-ready[i]
+		if !ok {
+			break // this chunk failed; firstErr is set below, still drain remaining goroutines
+		}
+		if writeErr == nil {
+			if _, err := w.Write(plaintext); err != nil {
+				writeErr = err
+			} else {
+				fileHash.Write(plaintext)
+			}
+		}
+	}
+	wg.Wait()
+
+	if firstErr != nil {
+		return firstErr
+	}
+	if writeErr != nil {
+		return writeErr
+	}
+	if got := hex.EncodeToString(fileHash.Sum(nil)); got != vf.ContentHash {
 		return fmt.Errorf("drivepool: content hash mismatch for %q: got %s want %s", virtualName, got, vf.ContentHash)
 	}
 	return nil
+}
+
+// downloadChunk downloads and decrypts one chunk, verifying it against its
+// own recorded plaintext hash before handing the bytes back.
+func (p *Pool) downloadChunk(ctx context.Context, fileKey []byte, chunk manifest.Chunk) ([]byte, error) {
+	a, ok := p.accounts[chunk.AccountID]
+	if !ok || a.initErr != nil {
+		return nil, fmt.Errorf("drivepool: chunk %d's account is unavailable", chunk.Index)
+	}
+
+	rc, err := a.Store.Download(ctx, chunk.RemoteFileID)
+	if err != nil {
+		return nil, fmt.Errorf("drivepool: download chunk %d: %w", chunk.Index, err)
+	}
+	defer rc.Close()
+
+	var plaintext bytes.Buffer
+	if _, err := storage.CopyDecrypt(fileKey, rc, &plaintext); err != nil {
+		return nil, fmt.Errorf("drivepool: decrypt chunk %d: %w", chunk.Index, err)
+	}
+
+	sum := sha256.Sum256(plaintext.Bytes())
+	if got := hex.EncodeToString(sum[:]); got != chunk.PlaintextSHA256 {
+		return nil, fmt.Errorf("drivepool: chunk %d hash mismatch: got %s want %s", chunk.Index, got, chunk.PlaintextSHA256)
+	}
+	return plaintext.Bytes(), nil
 }
 
 func (p *Pool) List(ctx context.Context, prefix string) ([]manifest.VirtualFile, error) {
