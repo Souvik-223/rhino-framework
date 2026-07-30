@@ -4,7 +4,7 @@ import TopBar from '../components/TopBar.vue'
 </script>
 
 <template>
-  <div class="flex h-full">
+  <div class="flex h-svh">
     <div class="animate-fade-in-up flex h-full">
       <Sidebar />
     </div>

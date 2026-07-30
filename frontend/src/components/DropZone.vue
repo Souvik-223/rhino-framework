@@ -78,9 +78,9 @@ function onFilePicked(e: Event) {
     </Transition>
 
     <label
-      class="bg-primary text-primary-foreground hover:bg-primary/90 fixed right-8 bottom-8 flex cursor-pointer items-center gap-2 rounded-full px-5 py-3 text-sm font-medium shadow-lg shadow-black/10 transition-all hover:scale-105 hover:shadow-xl"
+      class="bg-primary text-primary-foreground hover:bg-primary/90 fixed right-8 bottom-8 flex cursor-pointer items-center gap-1.5 rounded-full px-4 py-2.5 text-sm font-medium shadow-lg shadow-black/10 transition-all hover:scale-105 hover:shadow-xl"
     >
-      <Plus class="size-4" />
+      <Plus class="size-3.5" />
       Upload
       <input type="file" multiple class="hidden" @change="onFilePicked" />
     </label>
