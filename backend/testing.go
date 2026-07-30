@@ -19,14 +19,15 @@ import (
 // production code path.
 func NewTestServer(users *authdb.DB, userID string, pool *drivepool.Pool, sessionSecret []byte) *Server {
 	s := &Server{
-		cfg:   Config{SessionSecret: sessionSecret},
+		cfg:   Config{SessionSecret: sessionSecret, PublicURL: "http://localhost:8080"},
 		users: users,
 		cache: &poolCache{
 			pools: map[string]*poolCacheEntry{
 				userID: {pool: pool, lastUsed: time.Now()},
 			},
 		},
-		stopEvict: make(chan struct{}),
+		oauthPending: make(map[string]pendingOAuth),
+		stopEvict:    make(chan struct{}),
 	}
 	s.engine = s.newRouter()
 	return s

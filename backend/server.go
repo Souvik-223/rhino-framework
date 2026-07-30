@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/gin-contrib/sessions"
@@ -33,6 +34,9 @@ type Server struct {
 	cache  *poolCache
 	engine *gin.Engine
 
+	oauthMu      sync.Mutex
+	oauthPending map[string]pendingOAuth
+
 	stopEvict chan struct{}
 }
 
@@ -45,10 +49,11 @@ func New(ctx context.Context, cfg Config) (*Server, error) {
 	}
 
 	s := &Server{
-		cfg:       cfg,
-		users:     users,
-		cache:     newPoolCache(cfg.BaseDataDir, cfg.ClientSecretPath),
-		stopEvict: make(chan struct{}),
+		cfg:          cfg,
+		users:        users,
+		cache:        newPoolCache(cfg.BaseDataDir, cfg.ClientSecretPath),
+		oauthPending: make(map[string]pendingOAuth),
+		stopEvict:    make(chan struct{}),
 	}
 	s.engine = s.newRouter()
 
@@ -80,6 +85,7 @@ func (s *Server) evictLoop() {
 		select {
 		case <-ticker.C:
 			s.cache.evictIdle(idlePoolTimeout)
+			s.sweepExpiredOAuthState()
 		case <-s.stopEvict:
 			return
 		}
@@ -105,6 +111,10 @@ func (s *Server) newRouter() *gin.Engine {
 
 	r.GET("/healthz", s.handleHealthz)
 	r.GET("/readyz", s.handleReadyz)
+	// Not behind requireSession: the OAuth "state" value is what authorizes
+	// this request, since it's Google's redirect landing here, not our own
+	// frontend calling in — see handlers_oauth.go.
+	r.GET("/api/accounts/oauth/callback", s.handleOAuthCallback)
 
 	api := r.Group("/api")
 	api.POST("/auth/register", s.handleRegister)
@@ -115,7 +125,7 @@ func (s *Server) newRouter() *gin.Engine {
 	authed.Use(s.requireSession)
 	authed.GET("/me", s.handleMe)
 	authed.GET("/accounts", s.handleListAccounts)
-	authed.POST("/accounts", s.handleAddAccount)
+	authed.GET("/accounts/connect", s.handleConnectAccount)
 	authed.DELETE("/accounts/:label", s.handleRemoveAccount)
 	authed.GET("/files", s.handleListFiles)
 	authed.POST("/files", s.handleUploadFile)

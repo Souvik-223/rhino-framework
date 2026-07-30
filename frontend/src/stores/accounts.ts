@@ -15,9 +15,11 @@ export const useAccountsStore = defineStore('accounts', () => {
     }
   }
 
-  async function addAccount(label: string) {
-    await api.addAccount(label)
-    await refresh()
+  // Connecting an account means leaving the SPA entirely for Google's real
+  // consent screen, so this is a browser navigation, not an async action
+  // with a resolved/rejected outcome — see api.connectAccountUrl.
+  function connectAccount(label: string) {
+    window.location.href = api.connectAccountUrl(label)
   }
 
   async function removeAccount(label: string) {
@@ -25,5 +27,5 @@ export const useAccountsStore = defineStore('accounts', () => {
     await refresh()
   }
 
-  return { accounts, loading, refresh, addAccount, removeAccount }
+  return { accounts, loading, refresh, connectAccount, removeAccount }
 })

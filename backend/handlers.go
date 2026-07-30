@@ -50,34 +50,6 @@ func (s *Server) handleListAccounts(c *gin.Context) {
 	c.JSON(http.StatusOK, out)
 }
 
-type addAccountRequest struct {
-	Label string `json:"label" binding:"required"`
-}
-
-// handleAddAccount kicks off the OAuth consent flow for a new Drive
-// account (auth.RunConsentFlow, unchanged from the CLI's rhino account add
-// — see plans/web_portal.md phase 4). Not yet exercised by backend/tests:
-// RunConsentFlow needs a real OAuth client config, which the fake-backed
-// test Pool deliberately doesn't have.
-func (s *Server) handleAddAccount(c *gin.Context) {
-	pool, ok := s.pool(c)
-	if !ok {
-		return
-	}
-	var req addAccountRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	acc, err := pool.AddAccount(c.Request.Context(), req.Label)
-	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusCreated, gin.H{"label": acc.Label})
-}
-
 func (s *Server) handleRemoveAccount(c *gin.Context) {
 	pool, ok := s.pool(c)
 	if !ok {
@@ -97,7 +69,7 @@ func (s *Server) handleListFiles(c *gin.Context) {
 		return
 	}
 	prefix := c.Query("prefix")
-	files, err := pool.List(c.Request.Context(), prefix)
+	files, err := pool.ListWithAccounts(c.Request.Context(), prefix)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -110,6 +82,7 @@ func (s *Server) handleListFiles(c *gin.Context) {
 			"size":       f.Size,
 			"status":     f.Status,
 			"modifiedAt": f.ModifiedAt,
+			"accounts":   f.Accounts, // which drive(s) this file's chunks are stored on
 		})
 	}
 	c.JSON(http.StatusOK, out)

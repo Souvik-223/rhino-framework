@@ -4,25 +4,13 @@ import TopBar from '../components/TopBar.vue'
 </script>
 
 <template>
-  <div class="portal">
-    <Sidebar />
-    <div class="portal__main">
+  <div class="flex h-full">
+    <div class="animate-fade-in-up flex h-full">
+      <Sidebar />
+    </div>
+    <div class="bg-blueprint animate-fade-in-up flex min-w-0 flex-1 flex-col" style="animation-delay: 100ms">
       <TopBar />
       <slot />
     </div>
   </div>
 </template>
-
-<style scoped>
-.portal {
-  height: 100%;
-  display: flex;
-}
-
-.portal__main {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
-</style>

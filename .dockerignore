@@ -6,4 +6,10 @@ backend/dist/
 .claude/
 .agent/
 tasks/
+plans/
 *.md
+
+# local secrets — never let these into the build context
+.env
+secrets/
+data/

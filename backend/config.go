@@ -17,7 +17,8 @@ type Config struct {
 	BaseDataDir      string
 	ClientSecretPath string // shared OAuth app credential, one per deployment
 	SessionSecret    []byte
-	SessionSecure    bool // set the cookie's Secure flag; requires this process (or its reverse proxy) to terminate TLS
+	SessionSecure    bool   // set the cookie's Secure flag; requires this process (or its reverse proxy) to terminate TLS
+	PublicURL        string // this server's externally-reachable base URL; see handlers_oauth.go
 }
 
 // ConfigFromEnv builds a Config from RHINO_* environment variables,
@@ -32,9 +33,13 @@ func ConfigFromEnv(defaultBaseDataDir string) Config {
 		BaseDataDir:      baseDataDir,
 		ClientSecretPath: filepath.Join(baseDataDir, "client_secret.json"),
 		SessionSecure:    os.Getenv("RHINO_SESSION_SECURE") == "1",
+		PublicURL:        "http://localhost:8080", // matches serve.go's default --addr; override for anything else
 	}
 	if v := os.Getenv("RHINO_CLIENT_SECRET"); v != "" {
 		cfg.ClientSecretPath = v
+	}
+	if v := os.Getenv("RHINO_PUBLIC_URL"); v != "" {
+		cfg.PublicURL = strings.TrimRight(v, "/")
 	}
 
 	switch {

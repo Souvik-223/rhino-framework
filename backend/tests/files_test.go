@@ -54,6 +54,9 @@ func TestFileUploadListDownloadDelete(t *testing.T) {
 		t.Fatalf("decode list: %v", err)
 	}
 	resp.Body.Close()
+	if accounts, ok := files[0]["accounts"].([]any); !ok || len(accounts) != 1 || accounts[0] != "test-account" {
+		t.Errorf("want file to report [\"test-account\"] as its drive, got: %+v", files[0]["accounts"])
+	}
 	if len(files) != 1 || files[0]["name"] != "hello.txt" {
 		t.Fatalf("unexpected file list: %+v", files)
 	}

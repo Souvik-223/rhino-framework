@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref } from 'vue'
+import { toast } from 'vue-sonner'
 import { api, type VirtualFile } from '../api/client'
 
 interface UploadTask {
@@ -34,9 +35,11 @@ export const useFilesStore = defineStore('files', () => {
         task.fraction = fraction
       })
       uploads.value = uploads.value.filter((u) => u.id !== task.id)
+      toast.success(`Uploaded "${file.name}"`)
       await refresh()
     } catch (err) {
       task.error = err instanceof Error ? err.message : 'upload failed'
+      toast.error(`Failed to upload "${file.name}"`, { description: task.error })
     }
   }
 
@@ -50,6 +53,7 @@ export const useFilesStore = defineStore('files', () => {
 
   async function remove(name: string, purge: boolean) {
     await api.deleteFile(name, purge)
+    toast.success(purge ? `Deleted "${name}" permanently` : `Removed "${name}"`)
     await refresh()
   }
 

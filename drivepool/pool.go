@@ -12,6 +12,7 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -126,17 +127,81 @@ func (p *Pool) buildAccount(ctx context.Context, id, label string) *Account {
 	return a
 }
 
-// AddAccount runs the OAuth consent flow for a new account label, persists
-// its token, queries its starting quota, and registers it in the manifest.
+// AddAccount runs the CLI's interactive loopback OAuth consent flow
+// (auth.RunConsentFlow: bind a local port, print a URL, block waiting for
+// the browser to redirect back to that port) for a new account label,
+// persists its token, queries its starting quota, and registers it in the
+// manifest. This only works when the caller and the browser completing
+// consent are the same machine — see AuthCodeURL/CompleteConsent for the
+// web-redirect equivalent a remote HTTP backend needs instead.
 func (p *Pool) AddAccount(ctx context.Context, label string) (*Account, error) {
-	if _, ok := p.accounts[label]; ok {
-		return nil, fmt.Errorf("drivepool: account label %q already registered", label)
+	if err := p.checkLabelAvailable(ctx, label); err != nil {
+		return nil, err
 	}
 
 	tok, err := auth.RunConsentFlow(ctx, p.clientCfg)
 	if err != nil {
 		return nil, fmt.Errorf("drivepool: consent flow: %w", err)
 	}
+	return p.finishAddAccount(ctx, label, tok)
+}
+
+// AuthCodeURL returns the Google consent URL for registering a new account
+// under this Pool, using redirectURL as the OAuth callback. redirectURL
+// must exactly match one of the "Authorized redirect URIs" configured for
+// this OAuth client in Google Cloud Console — for a "Desktop app" client
+// (the CLI's kind), Google exempts any http://localhost/127.0.0.1 URI from
+// pre-registration, so local dev keeps working with the same
+// client_secret.json the CLI uses; a real public domain requires a
+// separate "Web application" type OAuth client with that exact redirect
+// URI registered ahead of time. The same redirectURL must be passed to
+// CompleteConsent for this same flow, since Google's token exchange
+// requires it to match what was used to obtain the authorization code.
+func (p *Pool) AuthCodeURL(redirectURL, state string) string {
+	cfg := *p.clientCfg
+	cfg.RedirectURL = redirectURL
+	return cfg.AuthCodeURL(state, oauth2.AccessTypeOffline)
+}
+
+// CompleteConsent exchanges an authorization code obtained via
+// AuthCodeURL's redirect for a token and finishes registering label —
+// the web-backend equivalent of AddAccount, for callers that receive the
+// code through their own HTTP callback route instead of driving
+// auth.RunConsentFlow's loopback listener themselves.
+func (p *Pool) CompleteConsent(ctx context.Context, redirectURL, code, label string) (*Account, error) {
+	if err := p.checkLabelAvailable(ctx, label); err != nil {
+		return nil, err
+	}
+
+	cfg := *p.clientCfg
+	cfg.RedirectURL = redirectURL
+	tok, err := cfg.Exchange(ctx, code)
+	if err != nil {
+		return nil, fmt.Errorf("drivepool: exchange code for token: %w", err)
+	}
+	return p.finishAddAccount(ctx, label, tok)
+}
+
+// checkLabelAvailable reports an error if label is already registered.
+// Checked against the manifest (the durable source of truth for
+// registered labels) rather than the in-memory p.accounts map, which is
+// keyed by generated account ID, not label.
+func (p *Pool) checkLabelAvailable(ctx context.Context, label string) error {
+	_, err := p.manifest.GetAccount(ctx, label)
+	if err == nil {
+		return fmt.Errorf("drivepool: account label %q already registered", label)
+	}
+	if !errors.Is(err, manifest.ErrNotFound) {
+		return fmt.Errorf("drivepool: check existing accounts: %w", err)
+	}
+	return nil
+}
+
+// finishAddAccount does the token-independent second half of registering
+// an account — build a client, query quota, and record everything in the
+// manifest — shared by AddAccount (CLI, token from the loopback flow) and
+// CompleteConsent (web backend, token from a code exchange).
+func (p *Pool) finishAddAccount(ctx context.Context, label string, tok *oauth2.Token) (*Account, error) {
 	if err := p.tokens.Save(label, tok); err != nil {
 		return nil, fmt.Errorf("drivepool: save token: %w", err)
 	}
@@ -607,6 +672,52 @@ func (p *Pool) downloadChunk(ctx context.Context, fileKey []byte, chunk manifest
 
 func (p *Pool) List(ctx context.Context, prefix string) ([]manifest.VirtualFile, error) {
 	return p.manifest.ListVirtualFiles(ctx, prefix)
+}
+
+// FileInfo is a virtual file plus the labels of every account currently
+// holding at least one of its chunks — used by the web portal to show
+// where a file's data actually lives, since a large file's chunks can be
+// spread across several accounts (see PutStream, §1.2).
+type FileInfo struct {
+	manifest.VirtualFile
+	Accounts []string
+}
+
+// ListWithAccounts is List plus, for each file, the deduplicated labels of
+// every account holding one of its chunks. Not used by the CLI (ls stays
+// on the plain List above) — kept separate so List's existing behavior
+// and callers are untouched.
+func (p *Pool) ListWithAccounts(ctx context.Context, prefix string) ([]FileInfo, error) {
+	files, err := p.manifest.ListVirtualFiles(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]FileInfo, 0, len(files))
+	for _, f := range files {
+		chunks, err := p.manifest.ListChunks(ctx, f.ID)
+		if err != nil {
+			return nil, err
+		}
+
+		seen := make(map[string]bool, len(chunks))
+		labels := make([]string, 0, len(chunks))
+		for _, c := range chunks {
+			if seen[c.AccountID] {
+				continue
+			}
+			seen[c.AccountID] = true
+
+			label := c.AccountID // fall back to the raw ID if the account was since removed
+			if a, ok := p.accounts[c.AccountID]; ok {
+				label = a.Label
+			}
+			labels = append(labels, label)
+		}
+
+		out = append(out, FileInfo{VirtualFile: f, Accounts: labels})
+	}
+	return out, nil
 }
 
 func (p *Pool) Remove(ctx context.Context, virtualName string, purge bool) error {

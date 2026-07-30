@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/Souvik-223/rhino-framework/drivepool/gdrive"
@@ -14,8 +15,14 @@ import (
 )
 
 // fakeStore is an in-memory RemoteStore so pool/placement logic can be
-// tested without any real Drive account or network access.
+// tested without any real Drive account or network access. Guarded by a
+// mutex because PutStream/GetStream upload and download chunks
+// concurrently, and two chunks of the same file can legitimately land on
+// the same account — a real Drive account has no shared local mutable
+// state to race on (it's just independent HTTP calls), but this fake's map
+// does, so it needs its own synchronization to correctly simulate that.
 type fakeStore struct {
+	mu         sync.Mutex
 	limit      int64
 	usage      int64
 	files      map[string][]byte // remoteFileID -> ciphertext
@@ -33,6 +40,9 @@ func (f *fakeStore) EnsureFolder(ctx context.Context, name string) (string, erro
 }
 
 func (f *fakeStore) Upload(ctx context.Context, name, folderID string, r io.ReaderAt, size int64) (string, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.failUpload {
 		return "", "", fmt.Errorf("fakeStore: simulated upload failure")
 	}
@@ -48,6 +58,9 @@ func (f *fakeStore) Upload(ctx context.Context, name, folderID string, r io.Read
 }
 
 func (f *fakeStore) Download(ctx context.Context, remoteFileID string) (io.ReadCloser, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	b, ok := f.files[remoteFileID]
 	if !ok {
 		return nil, os.ErrNotExist
@@ -56,12 +69,18 @@ func (f *fakeStore) Download(ctx context.Context, remoteFileID string) (io.ReadC
 }
 
 func (f *fakeStore) Delete(ctx context.Context, remoteFileID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	delete(f.files, remoteFileID)
 	f.deleted = append(f.deleted, remoteFileID)
 	return nil
 }
 
 func (f *fakeStore) Quota(ctx context.Context) (gdrive.QuotaInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	return gdrive.QuotaInfo{Limit: f.limit, Usage: f.usage}, nil
 }
 

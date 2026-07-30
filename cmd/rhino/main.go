@@ -1,8 +1,8 @@
 // Command rhino is the CLI for the Google-Drive-pooled storage feature:
 // it registers multiple Drive accounts, pools their free space, and
-// stores/retrieves files through that pool. See README.md and
-// tasks/modification_plan.md for the one-time Google Cloud setup this
-// requires before "account add" will work.
+// stores/retrieves files through that pool. See README.md for the
+// one-time Google Cloud setup this requires before "account add" will
+// work.
 package main
 
 import (
@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/joho/godotenv"
 
 	"github.com/Souvik-223/rhino-framework/drivepool"
 	"github.com/Souvik-223/rhino-framework/drivepool/gdrive"
@@ -19,14 +21,34 @@ import (
 var credentialsPath string
 
 func main() {
+	// Loads .env from the current directory into the process environment
+	// if one exists (RHINO_DATA_DIR, RHINO_SESSION_SECRET, etc. — see
+	// .env.example) — every RHINO_* var is read via os.Getenv, which only
+	// sees real process env vars, so without this a .env file sitting next
+	// to the binary would silently do nothing. Real environment variables
+	// (already set by the shell, Docker, etc.) always win: godotenv only
+	// fills in vars that aren't already set.
+	if err := godotenv.Load(); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintln(os.Stderr, "warning: could not load .env:", err)
+	}
+
 	root := &cobra.Command{
 		Use:           "rhino",
 		Short:         "Pool multiple Google Drive accounts into one virtual storage volume",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
-	root.PersistentFlags().StringVar(&credentialsPath, "credentials", "",
-		"path to the OAuth client_secret.json (default: <config dir>/rhino/client_secret.json)")
+	// RHINO_CLI_CLIENT_SECRET is deliberately a different env var from the
+	// backend's RHINO_CLIENT_SECRET (backend/config.go) — the CLI's OAuth
+	// client is normally a "Desktop app" credential (loopback redirect,
+	// auth.RunConsentFlow), while a deployed web portal typically needs its
+	// own separate "Web application" credential with a fixed registered
+	// redirect URI (see plans/web_portal.md and the README's setup notes).
+	// Keeping the env vars distinct lets both point at different
+	// client_secret.json files from the same .env without either
+	// overriding the other.
+	root.PersistentFlags().StringVar(&credentialsPath, "credentials", envOr("RHINO_CLI_CLIENT_SECRET", ""),
+		"path to the OAuth client_secret.json (default: <config dir>/rhino/client_secret.json, or $RHINO_CLI_CLIENT_SECRET if set)")
 
 	root.AddCommand(newAccountCmd(), newPutCmd(), newGetCmd(), newLsCmd(), newRmCmd(), newStatusCmd(), newServeCmd())
 

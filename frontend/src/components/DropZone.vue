@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref } from 'vue'
 import { useFilesStore } from '../stores/files'
+import { UploadCloud, Plus } from '@lucide/vue'
 
 const files = useFilesStore()
 const dragging = ref(false)
@@ -54,58 +55,34 @@ function onFilePicked(e: Event) {
 </script>
 
 <template>
-  <div class="drop-zone">
+  <div class="relative flex min-h-0 flex-1 flex-col">
     <slot />
 
-    <div v-if="dragging" class="drop-zone__overlay">
-      <div class="drop-zone__message">Drop files here to upload</div>
-    </div>
+    <Transition
+      enter-active-class="transition-all duration-200"
+      enter-from-class="opacity-0 scale-95"
+      leave-active-class="transition-all duration-150"
+      leave-to-class="opacity-0 scale-95"
+    >
+      <div
+        v-if="dragging"
+        class="bg-background/90 fixed inset-0 z-50 flex items-center justify-center backdrop-blur-sm"
+      >
+        <div
+          class="animate-pulse-ring border-primary bg-card flex flex-col items-center gap-3 rounded-2xl border-2 border-dashed px-16 py-14 shadow-2xl"
+        >
+          <UploadCloud class="text-primary size-10" />
+          <p class="font-heading text-lg font-semibold tracking-tight">Drop files here to upload</p>
+        </div>
+      </div>
+    </Transition>
 
-    <label class="drop-zone__picker btn btn-primary">
-      + Upload
-      <input type="file" multiple class="drop-zone__input" @change="onFilePicked" />
+    <label
+      class="bg-primary text-primary-foreground hover:bg-primary/90 fixed right-8 bottom-8 flex cursor-pointer items-center gap-2 rounded-full px-5 py-3 text-sm font-medium shadow-lg shadow-black/10 transition-all hover:scale-105 hover:shadow-xl"
+    >
+      <Plus class="size-4" />
+      Upload
+      <input type="file" multiple class="hidden" @change="onFilePicked" />
     </label>
   </div>
 </template>
-
-<style scoped>
-.drop-zone {
-  position: relative;
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-}
-
-.drop-zone__overlay {
-  position: fixed;
-  inset: 0;
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-  border: 3px dashed var(--accent);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 100;
-  pointer-events: none;
-}
-
-.drop-zone__message {
-  font-size: 1.5rem;
-  font-weight: 600;
-  color: var(--accent);
-  background: var(--bg);
-  padding: 1rem 2rem;
-  border-radius: var(--radius);
-}
-
-.drop-zone__picker {
-  position: absolute;
-  bottom: 1.5rem;
-  right: 1.5rem;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
-}
-
-.drop-zone__input {
-  display: none;
-}
-</style>

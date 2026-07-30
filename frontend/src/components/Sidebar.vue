@@ -2,11 +2,13 @@
 import { onMounted, ref } from 'vue'
 import { useAccountsStore } from '../stores/accounts'
 import { formatBytes, usageLevel } from '../composables/useBytes'
+import { Progress } from '@/components/ui/progress'
+import { Input } from '@/components/ui/input'
+import { Button } from '@/components/ui/button'
+import { HardDrive, Plus, X } from '@lucide/vue'
 
 const store = useAccountsStore()
 const newLabel = ref('')
-const adding = ref(false)
-const addError = ref('')
 
 onMounted(() => store.refresh())
 
@@ -15,152 +17,78 @@ function usedFraction(a: { limit?: number; usage?: number; unlimited?: boolean }
   return (a.usage ?? 0) / a.limit
 }
 
-async function connectAccount() {
+const levelClasses: Record<'ok' | 'warn' | 'danger', string> = {
+  ok: 'bg-ok',
+  warn: 'bg-warn',
+  danger: 'bg-destructive',
+}
+
+// Navigates the whole browser to Google's consent screen — see
+// stores/accounts.ts and backend/handlers_oauth.go.
+function connectAccount() {
   if (!newLabel.value.trim()) return
-  adding.value = true
-  addError.value = ''
-  try {
-    await store.addAccount(newLabel.value.trim())
-    newLabel.value = ''
-  } catch (err) {
-    addError.value = err instanceof Error ? err.message : 'could not connect account'
-  } finally {
-    adding.value = false
-  }
+  store.connectAccount(newLabel.value.trim())
 }
 </script>
 
 <template>
-  <aside class="sidebar">
-    <h2 class="sidebar__title">Connected drives</h2>
+  <aside
+    class="bg-sidebar border-sidebar-border flex w-72 shrink-0 flex-col gap-5 border-r p-5"
+  >
+    <div class="font-heading text-primary text-xl font-bold tracking-tight uppercase">Rhino</div>
 
-    <ul class="sidebar__accounts">
-      <li v-for="a in store.accounts" :key="a.label" class="account">
-        <div class="account__row">
-          <span class="account__label">{{ a.label }}</span>
+    <div class="flex items-center justify-between">
+      <h2 class="text-muted-foreground text-xs font-semibold tracking-wider uppercase">
+        Connected drives
+      </h2>
+    </div>
+
+    <ul class="flex flex-col gap-3">
+      <li
+        v-for="(a, i) in store.accounts"
+        :key="a.label"
+        class="animate-fade-in-up bg-card/60 group rounded-lg border border-border/60 p-3 transition-colors hover:border-border"
+        :style="{ animationDelay: `${i * 60}ms` }"
+      >
+        <div class="flex items-center justify-between gap-2">
+          <div class="flex min-w-0 items-center gap-2">
+            <HardDrive class="text-primary size-4 shrink-0" />
+            <span class="truncate text-sm font-medium">{{ a.label }}</span>
+          </div>
           <button
-            class="account__remove"
+            class="text-muted-foreground hover:text-destructive shrink-0 opacity-0 transition-opacity group-hover:opacity-100"
             title="Disconnect"
             @click="store.removeAccount(a.label)"
           >
-            &times;
+            <X class="size-3.5" />
           </button>
         </div>
 
-        <p v-if="a.error" class="account__error">unavailable: {{ a.error }}</p>
-        <p v-else-if="a.unlimited" class="account__meta">unlimited</p>
+        <p v-if="a.error" class="text-destructive mt-1.5 text-xs">unavailable: {{ a.error }}</p>
+        <p v-else-if="a.unlimited" class="text-muted-foreground mt-1.5 text-xs">unlimited</p>
         <template v-else>
-          <div class="usage-bar">
-            <div
-              class="usage-bar__fill"
-              :class="`usage-bar__fill--${usageLevel(usedFraction(a))}`"
-              :style="{ width: `${Math.min(usedFraction(a) * 100, 100)}%` }"
-            />
-          </div>
-          <p class="account__meta">
-            {{ formatBytes(a.usage ?? 0) }} of {{ formatBytes(a.limit ?? 0) }} used
+          <Progress
+            :model-value="Math.min(usedFraction(a) * 100, 100)"
+            class="mt-2 h-1.5"
+            :indicator-class="levelClasses[usageLevel(usedFraction(a))]"
+          />
+          <p class="text-muted-foreground mt-1.5 font-mono text-[11px]">
+            {{ formatBytes(a.usage ?? 0) }} / {{ formatBytes(a.limit ?? 0) }}
           </p>
         </template>
       </li>
     </ul>
 
-    <p v-if="!store.loading && store.accounts.length === 0" class="sidebar__empty">
+    <p v-if="!store.loading && store.accounts.length === 0" class="text-muted-foreground text-sm">
       No drives connected yet.
     </p>
 
-    <form class="sidebar__connect" @submit.prevent="connectAccount">
-      <input v-model="newLabel" placeholder="e.g. home-gmail" :disabled="adding" />
-      <button class="btn btn-primary" type="submit" :disabled="adding">
-        + Connect account
-      </button>
-      <p v-if="addError" class="account__error">{{ addError }}</p>
+    <form class="mt-auto flex flex-col gap-2 border-t border-border/60 pt-4" @submit.prevent="connectAccount">
+      <Input v-model="newLabel" placeholder="e.g. home-gmail" class="h-9" />
+      <Button type="submit" class="w-full gap-1.5">
+        <Plus class="size-4" />
+        Connect account
+      </Button>
     </form>
   </aside>
 </template>
-
-<style scoped>
-.sidebar {
-  width: 260px;
-  flex-shrink: 0;
-  border-right: 1px solid var(--border);
-  padding: 1rem;
-  display: flex;
-  flex-direction: column;
-  gap: 1rem;
-  overflow-y: auto;
-}
-
-.sidebar__title {
-  font-size: 0.85rem;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--text-dim);
-  margin: 0;
-}
-
-.sidebar__accounts {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 0.75rem;
-}
-
-.account__row {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
-.account__label {
-  font-weight: 600;
-  font-size: 0.9rem;
-}
-
-.account__remove {
-  border: none;
-  background: none;
-  color: var(--text-dim);
-  font-size: 1rem;
-  line-height: 1;
-}
-
-.account__remove:hover {
-  color: var(--danger);
-}
-
-.account__meta {
-  margin: 0.25rem 0 0;
-  font-size: 0.78rem;
-  color: var(--text-dim);
-}
-
-.account__error {
-  margin: 0.25rem 0 0;
-  font-size: 0.78rem;
-  color: var(--danger);
-}
-
-.sidebar__empty {
-  font-size: 0.85rem;
-  color: var(--text-dim);
-}
-
-.sidebar__connect {
-  margin-top: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  padding-top: 1rem;
-  border-top: 1px solid var(--border);
-}
-
-.sidebar__connect input {
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 0.4rem 0.6rem;
-  background: var(--bg);
-  color: var(--text);
-}
-</style>

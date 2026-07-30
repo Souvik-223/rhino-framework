@@ -14,7 +14,7 @@ describe('FileGrid', () => {
     expect(wrapper.text()).toContain('No files yet')
   })
 
-  it('renders a row per file with a formatted size', () => {
+  it('renders a row per file with a formatted size and its drive(s)', () => {
     const store = useFilesStore()
     store.files = [
       {
@@ -22,14 +22,34 @@ describe('FileGrid', () => {
         size: 2048,
         status: 'complete',
         modifiedAt: new Date().toISOString(),
+        accounts: ['home-gmail', 'work-gmail'],
       },
     ]
 
     const wrapper = mount(FileGrid)
     expect(wrapper.text()).toContain('docs/hello.txt')
     expect(wrapper.text()).toContain('2.0 KiB')
-    expect(wrapper.text()).toContain('complete')
+    expect(wrapper.text()).toContain('home-gmail')
+    expect(wrapper.text()).toContain('work-gmail')
+    // "complete" files don't get a status badge — only unusual statuses do.
+    expect(wrapper.text()).not.toContain('complete')
     expect(wrapper.text()).not.toContain('No files yet')
+  })
+
+  it('shows a status badge for a non-complete file', () => {
+    const store = useFilesStore()
+    store.files = [
+      {
+        name: 'partial.bin',
+        size: 100,
+        status: 'incomplete',
+        modifiedAt: new Date().toISOString(),
+        accounts: ['home-gmail'],
+      },
+    ]
+
+    const wrapper = mount(FileGrid)
+    expect(wrapper.text()).toContain('incomplete')
   })
 
   it('shows an in-progress upload with its own progress bar', () => {
