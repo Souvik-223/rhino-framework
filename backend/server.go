@@ -8,15 +8,17 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-contrib/sessions/cookie"
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 
 	"github.com/Souvik-223/rhino-framework/backend/authdb"
+	rhinodb "github.com/Souvik-223/rhino-framework/db"
+	"github.com/Souvik-223/rhino-framework/drivepool/manifest"
 )
 
 const (
@@ -25,11 +27,12 @@ const (
 	idlePoolTimeout   = 30 * time.Minute
 )
 
-// Server holds the portal's shared state: the login-account database and
-// the per-user drivepool.Pool cache (§1 of the plan). One Server per
-// running `rhino serve` process.
+// Server holds the portal's shared state: one Postgres connection pool
+// (gdb), the login-account database, and the per-user drivepool.Pool cache
+// (§1 of the plan). One Server per running `rhino serve` process.
 type Server struct {
 	cfg    Config
+	gdb    *gorm.DB
 	users  *authdb.DB
 	cache  *poolCache
 	engine *gin.Engine
@@ -40,18 +43,23 @@ type Server struct {
 	stopEvict chan struct{}
 }
 
-// New opens (or creates) users.db under cfg.BaseDataDir and builds the
-// router. Per-user Pools are opened lazily on first request, not here.
+// New connects to cfg.DatabaseURL, applies any pending migrations, and
+// builds the router. Per-user Pools are opened lazily on first request, not
+// here — they all share this same connection pool underneath.
 func New(ctx context.Context, cfg Config) (*Server, error) {
-	users, err := authdb.Open(filepath.Join(cfg.BaseDataDir, "users.db"))
+	if err := rhinodb.Migrate(cfg.DatabaseURL); err != nil {
+		return nil, fmt.Errorf("backend: migrate database: %w", err)
+	}
+	gdb, err := rhinodb.Open(cfg.DatabaseURL)
 	if err != nil {
-		return nil, fmt.Errorf("backend: open authdb: %w", err)
+		return nil, fmt.Errorf("backend: open database: %w", err)
 	}
 
 	s := &Server{
 		cfg:          cfg,
-		users:        users,
-		cache:        newPoolCache(cfg.BaseDataDir, cfg.ClientSecretPath),
+		gdb:          gdb,
+		users:        authdb.New(gdb),
+		cache:        newPoolCache(manifest.New(gdb, cfg.TokenEncryptionKey), cfg.ClientSecretPath),
 		oauthPending: make(map[string]pendingOAuth),
 		stopEvict:    make(chan struct{}),
 	}
@@ -69,13 +77,17 @@ func (s *Server) Router() http.Handler {
 	return s.engine
 }
 
-// Close stops the idle-pool eviction loop, closes every cached per-user
-// Pool, and closes the authdb handle. Call after the HTTP server has
-// stopped accepting new requests.
+// Close stops the idle-pool eviction loop, drops every cached per-user
+// Pool, and closes the shared database connection pool. Call after the
+// HTTP server has stopped accepting new requests.
 func (s *Server) Close() error {
 	close(s.stopEvict)
 	s.cache.closeAll()
-	return s.users.Close()
+	sqlDB, err := s.gdb.DB()
+	if err != nil {
+		return err
+	}
+	return sqlDB.Close()
 }
 
 func (s *Server) evictLoop() {

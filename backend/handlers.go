@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -8,6 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/Souvik-223/rhino-framework/drivepool"
+	"github.com/Souvik-223/rhino-framework/drivepool/manifest"
 )
 
 // pool resolves the calling user's Pool via the cache, writing a JSON
@@ -44,6 +46,9 @@ func (s *Server) handleListAccounts(c *gin.Context) {
 			entry["usage"] = st.Usage
 			entry["available"] = st.Available
 			entry["unlimited"] = st.Unlimited
+			if st.PhotoURL != "" {
+				entry["photoUrl"] = st.PhotoURL
+			}
 		}
 		out = append(out, entry)
 	}
@@ -56,7 +61,12 @@ func (s *Server) handleRemoveAccount(c *gin.Context) {
 		return
 	}
 	label := c.Param("label")
-	if err := pool.RemoveAccount(c.Request.Context(), label); err != nil {
+	force, _ := strconv.ParseBool(c.Query("force"))
+	if err := pool.RemoveAccount(c.Request.Context(), label, force); err != nil {
+		if errors.Is(err, drivepool.ErrAccountInUse) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
@@ -82,7 +92,8 @@ func (s *Server) handleListFiles(c *gin.Context) {
 			"size":       f.Size,
 			"status":     f.Status,
 			"modifiedAt": f.ModifiedAt,
-			"accounts":   f.Accounts, // which drive(s) this file's chunks are stored on
+			"accounts":   f.Accounts,
+			"degraded":   f.Degraded,
 		})
 	}
 	c.JSON(http.StatusOK, out)
@@ -117,6 +128,10 @@ func (s *Server) handleUploadFile(c *gin.Context) {
 	defer f.Close()
 
 	if err := pool.PutStream(c.Request.Context(), f, fileHeader.Size, virtualName); err != nil {
+		if errors.Is(err, manifest.ErrNameExists) {
+			c.JSON(http.StatusConflict, gin.H{"error": fmt.Sprintf("a file named %q already exists — delete it permanently first if you want to reuse the name", virtualName)})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

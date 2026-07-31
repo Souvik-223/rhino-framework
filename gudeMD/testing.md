@@ -26,14 +26,24 @@ all actually run against this codebase (not generic advice) — see
 | Need | Required for |
 | --- | --- |
 | Go 1.25+ | Everything |
+| A reachable Postgres instance (`DATABASE_URL`) | All `drivepool`/`backend` automated tests and any `rhino`/`rhino serve` invocation — see below, no SQLite fallback exists anymore |
 | Node.js 22+ / npm | Building or testing `frontend/` |
 | `make` (git-bash/WSL) | Optional — every `make` target has a raw-command equivalent below |
 | A real Google Cloud OAuth `client_secret.json` | Only for *actually connecting a Drive account and moving real files* — every automated test and most manual API/UI testing works without one |
 | Docker + Docker Compose | Only for §7 |
 | A C compiler (gcc/clang) | Only for `go test -race` |
 
-Nothing else needs installing — `modernc.org/sqlite` is pure Go (no CGO), and
-every dependency is fetched by `go mod download` / `npm install`.
+**Postgres for local dev**: no Docker on this machine? Podman works too
+(Docker-CLI-compatible):
+```bash
+podman machine start   # one-time-ish, boots the WSL VM
+podman run -d --name rhino-pg -p 5432:5432 \
+  -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=rhino_dev postgres:16-alpine
+export DATABASE_URL="postgres://postgres:postgres@localhost:5432/rhino_dev?sslmode=disable"
+```
+`db.Migrate` runs automatically on every `rhino`/`rhino serve` invocation
+and in the `dbtest` test helper — no separate migrate step needed. Tests
+that don't find `DATABASE_URL` set skip (not fail).
 
 > **No `make` available?** Every target below is a one-liner; the raw
 > command is always shown alongside it.
@@ -43,7 +53,7 @@ every dependency is fetched by `go mod download` / `npm install`.
 ## 2. Quick start — verify everything in one pass
 
 ```bash
-# Go side: build, vet, test every package
+# Go side: build, vet, test every package (DATABASE_URL must be set — see §1)
 go build ./... && go vet ./... && go test ./... -v
 
 # Frontend: type-check, build, test
@@ -72,12 +82,17 @@ go test ./storage/... ./p2p/... -v  # just the P2P side
 | --- | --- |
 | `storage` | CAS path-sharding (`store_test.go`), write/read/has/delete round trip, AES-256-CTR encrypt→decrypt round trip (`crypto_test.go`) |
 | `p2p` | `TCPTransport` dial/accept smoke test |
-| `drivepool` (`pool_test.go`) | Placement (`pickAccount` picks the most-free healthy account, skips unhealthy ones, errors when none are healthy), full `Put`/`Get` round trip against a fake in-memory Drive account |
+| `drivepool` (`pool_test.go`) | Placement (`pickAccount` picks the most-free healthy account, skips unhealthy ones, errors when none are healthy), full `Put`/`Get` round trip against a fake in-memory Drive account, account-removal guard (`ErrAccountInUse`/`force`), and `TestPoolsAreTenantIsolated` — two `Pool`s scoped to different users never see each other's accounts/files |
 | `drivepool` (`chunking_test.go`) | A file larger than `ChunkSize` actually splits into multiple chunks; those chunks land on **different** accounts (not all on one); a mid-upload chunk failure triggers best-effort cleanup of the chunks that *did* upload, and leaves no manifest record; a chunk whose stored ciphertext is tampered with post-upload is detected and `GetStream` fails rather than silently returning corrupted data |
+| `drivepool/manifest` (`manifest_test.go`) | Token encrypt/decrypt round trip, tenant isolation and per-user `UNIQUE(user_id, name/label)` on accounts and virtual files, `ON DELETE CASCADE` (chunks with their virtual file) and `ON DELETE SET NULL` (chunks when their account is removed), `CountActiveChunks` excluding soft-deleted files |
 | `backend/tests` | Register → `/me` → logout → `/me` now 401; duplicate-username registration is rejected (409); wrong password is rejected (401); `/api/accounts`/`/api/files` require a session (401 without one); full upload → list → download → delete round trip over real HTTP via the real Gin router; `/healthz`/`/readyz` |
 
 None of these touch the real network or a real Google account — `drivepool`
 and `backend/tests` both run against a fake in-memory `gdrive.RemoteStore`.
+All of them *do* touch a real Postgres instance (`DATABASE_URL`), each
+inside its own transaction that's rolled back when the test finishes
+(`db/dbtest`) — so tests never see each other's data and need no cleanup,
+but they do `t.Skip` (not fail) if `DATABASE_URL` isn't set.
 
 **Race detector**: `go test ./... -race` needs CGO + a real C compiler
 (`CGO_ENABLED=1` requires gcc/clang on `PATH`). If that's not available, skip
@@ -135,11 +150,22 @@ Every CLI command *except* `account add` (and anything that needs a
 registered account) works with zero setup:
 
 ```bash
+export DATABASE_URL="postgres://postgres:postgres@localhost:5432/rhino_dev?sslmode=disable"  # see §1
+export RHINO_TOKEN_ENCRYPTION_KEY="$(openssl rand -hex 32)"   # any 64-hex-char value works for local testing
+export RHINO_USER=alice   # required — identifies whose data every command reads/writes; auto-provisioned on first use
+
 go build -o bin/rhino ./cmd/rhino     # or: make build-rhino
 ./bin/rhino account list               # "no accounts registered yet — try: rhino account add --label <name>"
 ./bin/rhino ls                          # "no files stored yet"
 ./bin/rhino status                      # "0/0 accounts healthy | 0 B total | 0 B free | 0 files"
 ```
+
+Every command requires `--user`/`RHINO_USER` — there's no default identity,
+since a shared machine with an implicit default user is exactly the kind of
+mistake that leaks one person's files into another's view (see
+`er_diagram.md`'s "CLI identity" section). Pointing it at a fresh name
+auto-provisions a CLI-only identity; pointing it at an existing web-portal
+username operates on that person's real data (it's the same `users` table).
 
 `account add`, `put`, `get`, `ls`, `status` on a pool with accounts all
 require a `client_secret.json` because `openPool()` always loads the OAuth
@@ -300,17 +326,19 @@ curl -i http://localhost:8080/api/files
 ```
 
 **Testing without real Google credentials at all** (register/login/health
-only — `/api/accounts`/`/api/files` need *some* `client_secret.json` to exist
-under `RHINO_DATA_DIR`, even a structurally-valid dummy one, since opening a
-user's Pool loads the OAuth client config regardless of whether any account
-is actually connected yet):
+only — `/api/accounts`/`/api/files` need *some* `client_secret.json` to
+exist, even a structurally-valid dummy one, since opening a user's Pool
+loads the OAuth client config regardless of whether any account is
+actually connected yet):
 
 ```bash
 mkdir -p /tmp/rhino-test-data
 cat > /tmp/rhino-test-data/client_secret.json <<'EOF'
 {"installed":{"client_id":"dummy.apps.googleusercontent.com","client_secret":"dummy","redirect_uris":["http://localhost"],"auth_uri":"https://accounts.google.com/o/oauth2/auth","token_uri":"https://oauth2.googleapis.com/token"}}
 EOF
-export RHINO_DATA_DIR=/tmp/rhino-test-data
+export DATABASE_URL="postgres://postgres:postgres@localhost:5432/rhino_dev?sslmode=disable"
+export RHINO_TOKEN_ENCRYPTION_KEY="$(openssl rand -hex 32)"
+export RHINO_CLIENT_SECRET=/tmp/rhino-test-data/client_secret.json
 export RHINO_SESSION_SECRET="local-test-secret-at-least-this-long"
 ./bin/rhino serve
 ```
@@ -326,9 +354,9 @@ auth+routing+session stack works before you have real Drive credentials.
 ```bash
 docker build -t rhino .
 docker run --rm -p 8080:8080 \
-  -e RHINO_DATA_DIR=/data \
+  -e DATABASE_URL="postgres://postgres:postgres@host.docker.internal:5432/rhino_dev?sslmode=disable" \
+  -e RHINO_TOKEN_ENCRYPTION_KEY="$(openssl rand -hex 32)" \
   -e RHINO_SESSION_SECRET=local-docker-test-secret-32bytes \
-  -v rhino-test-data:/data \
   rhino
 curl -i http://localhost:8080/healthz
 ```
@@ -338,6 +366,8 @@ Full stack with the Caddy reverse proxy (requires real secrets files first):
 ```bash
 mkdir -p secrets
 echo -n "$(openssl rand -base64 32)" > secrets/session_secret.txt
+echo -n "postgres://user:pass@your-neon-host/db?sslmode=require" > secrets/database_url.txt
+echo -n "$(openssl rand -hex 32)" > secrets/token_encryption_key.txt
 cp /path/to/client_secret.json secrets/client_secret.json
 # edit Caddyfile's placeholder domain before this will actually get a cert
 
@@ -350,8 +380,10 @@ Things worth specifically checking here that don't show up in local testing:
 - The image contains no Node/Go toolchain (`docker run --rm rhino sh` should
   fail — the runtime image is `distroless/static`, there's no shell).
 - Data survives a restart: `docker compose restart rhino` then confirm
-  previously-registered users/files are still there (proves the volume
-  mount is working, not just in-container state).
+  previously-registered users/files are still there — since all durable
+  state lives in the external Postgres database now (not a local volume),
+  this is really testing that the container reconnects correctly, not that
+  a volume mount works.
 - Graceful shutdown: `docker compose stop rhino` shouldn't drop an in-flight
   request abruptly — `cmd/rhino/serve.go`'s `signal.NotifyContext` +
   `http.Server.Shutdown` should drain it first (harder to observe directly,
@@ -366,7 +398,9 @@ Things worth specifically checking here that don't show up in local testing:
 Nothing below needs to be run manually if you push to GitHub — it's here so
 you know what's already covered before you look for it yourself.
 
-`.github/workflows/ci.yml` — every push/PR:
+`.github/workflows/ci.yml` — every push/PR (the `go` job runs a
+`postgres:16-alpine` service container and sets `DATABASE_URL` to point at
+it, so the full Postgres-backed test suite runs for real, not skipped):
 ```
 go vet ./...
 go build ./...
@@ -399,7 +433,8 @@ version and `latest`.
 | Tampered-chunk detection | `go test ./drivepool/...` (`TestGetStreamDetectsTamperedChunk`) |
 | Graceful degradation (one bad account doesn't break others) | Revoke one account's token/consent in your Google account settings, then confirm other commands still work and only that account reports "unavailable" |
 | Portal registration/login/logout/session enforcement | §6.3 or §6.5, or `go test ./backend/...` |
-| Multi-tenant isolation | §6.4 |
+| Multi-tenant isolation (web portal, session-based) | §6.4 |
+| Multi-tenant isolation (database level — every table's `user_id` scoping) | `go test ./drivepool/...` (`TestPoolsAreTenantIsolated`) and `./drivepool/manifest/...` (`TestAccountsAreTenantIsolated`, `TestVirtualFilesAreTenantIsolatedAndPerUserUnique`) |
 | Drag-and-drop upload + file-picker fallback | §6.3 (browser), or `npm run test` (`DropZone.test.ts`) |
 | Download / delete (with purge option) | §6.3 or §6.5 |
 | Usage bars / thresholds (green/amber/red) | §6.3 (browser) or `npm run test` (`useBytes.test.ts`) |
@@ -412,6 +447,19 @@ version and `latest`.
 ---
 
 ## 10. Troubleshooting
+
+**`db: DATABASE_URL (or DATABASE_URL_FILE) is not set`** — every `rhino`
+command and `go test ./...` needs a real Postgres to talk to now; there's no
+local zero-config SQLite fallback anymore. See §1's Podman/Docker snippet.
+
+**`db: RHINO_TOKEN_ENCRYPTION_KEY(_FILE) must be set to 32 bytes, hex-encoded`**
+— `export RHINO_TOKEN_ENCRYPTION_KEY="$(openssl rand -hex 32)"`. This key
+encrypts every stored OAuth token; losing/rotating it makes previously
+connected accounts undecryptable (they'd need reconnecting).
+
+**`rhino: no user configured — set RHINO_USER or pass --user <name>`** —
+every CLI command needs an identity now (`--user`/`RHINO_USER`); there's no
+default, on purpose.
 
 **`open .../client_secret.json: no such file`** — expected until you've done
 the one-time Google Cloud setup (§5.2). Everything else (registration,

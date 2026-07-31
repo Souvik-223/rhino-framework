@@ -10,43 +10,38 @@ import (
 	"github.com/Souvik-223/rhino-framework/drivepool/manifest"
 )
 
-// ResolveDataDir returns the directory rhino should read/write its
-// manifest, tokens, and OAuth client config from. override (typically
-// os.Getenv("RHINO_DATA_DIR")) wins if set; otherwise falls back to
-// os.UserConfigDir()/rhino, matching the CLI's original behavior exactly.
-func ResolveDataDir(override string) (string, error) {
-	if override != "" {
-		return override, nil
-	}
+// DefaultClientSecretPath returns where the CLI's OAuth app credential
+// (client_secret.json) is read from when neither --credentials nor
+// RHINO_CLI_CLIENT_SECRET is set. This is the one piece of local
+// filesystem config drivepool still resolves a default for — it's a
+// shared, app-level secret, not per-user data (that all lives in Postgres
+// now — see manifest.New/Open).
+func DefaultClientSecretPath() (string, error) {
 	dir, err := os.UserConfigDir()
 	if err != nil {
 		return "", fmt.Errorf("drivepool: resolve config dir: %w", err)
 	}
-	return filepath.Join(dir, "rhino"), nil
+	return filepath.Join(dir, "rhino", "client_secret.json"), nil
 }
 
-// OpenFromDataDir wires up the manifest, token store, and OAuth client
-// config found under dataDir and opens a Pool. credentialsPath overrides
-// where client_secret.json is read from — pass "" to default to
-// dataDir/client_secret.json (the CLI's layout), or an explicit shared path
-// (used when dataDir is a per-user directory but the OAuth app credential
-// is shared across every user).
-func OpenFromDataDir(ctx context.Context, dataDir, credentialsPath string, scopes ...string) (*Pool, error) {
-	m, err := manifest.Open(filepath.Join(dataDir, "manifest.db"))
-	if err != nil {
-		return nil, fmt.Errorf("drivepool: open manifest: %w", err)
-	}
-
-	tokens := auth.NewTokenStore(filepath.Join(dataDir, "accounts"))
-
+// OpenWithUser loads the OAuth client config from credentialsPath (falling
+// back to DefaultClientSecretPath if empty) and opens a Pool scoped to
+// userID against the already-open, already-migrated manifest m — the
+// Postgres-backed equivalent of the old OpenFromDataDir, now that there's
+// no per-installation local directory to resolve: m is shared across every
+// user, and only the OAuth app credential still comes from a local file.
+func OpenWithUser(ctx context.Context, m *manifest.Manifest, userID, credentialsPath string, scopes ...string) (*Pool, error) {
 	if credentialsPath == "" {
-		credentialsPath = filepath.Join(dataDir, "client_secret.json")
+		var err error
+		credentialsPath, err = DefaultClientSecretPath()
+		if err != nil {
+			return nil, err
+		}
 	}
 	clientCfg, err := auth.LoadClientConfig(credentialsPath, scopes...)
 	if err != nil {
-		m.Close()
 		return nil, fmt.Errorf("drivepool: load OAuth client config: %w", err)
 	}
 
-	return Open(ctx, m, tokens, clientCfg)
+	return Open(ctx, m, userID, clientCfg)
 }

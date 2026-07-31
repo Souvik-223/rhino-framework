@@ -20,8 +20,6 @@ function apply(t: Theme) {
   document.documentElement.classList.toggle('dark', t === 'dark')
 }
 
-// Applied once at module load (imported from main.ts) so there's no flash
-// of the wrong theme before any component mounts.
 apply(theme.value)
 
 export function useTheme() {

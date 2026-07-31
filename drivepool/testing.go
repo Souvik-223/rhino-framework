@@ -14,6 +14,6 @@ import "github.com/Souvik-223/rhino-framework/drivepool/manifest"
 // it at all. It is not used by any production code path — only by test
 // packages (drivepool's own pool_test.go included) that need a Pool wired
 // to a fake gdrive.RemoteStore instead of a real OAuth/Drive dependency.
-func NewPoolForTesting(m *manifest.Manifest, accounts map[string]*Account) *Pool {
-	return &Pool{manifest: m, accounts: accounts}
+func NewPoolForTesting(m *manifest.Manifest, userID string, accounts map[string]*Account) *Pool {
+	return &Pool{manifest: m, userID: userID, accounts: accounts}
 }

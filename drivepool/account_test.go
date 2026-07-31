@@ -35,8 +35,8 @@ func TestCheckLabelAvailableRejectsDuplicates(t *testing.T) {
 		t.Fatalf("want a fresh label to be available, got: %v", err)
 	}
 
-	if err := p.manifest.AddAccount(ctx, manifest.Account{
-		ID: "acct-1", Label: "home-gmail", TokenPath: "unused", AddedAt: time.Now(),
+	if err := p.manifest.AddAccount(ctx, p.userID, manifest.Account{
+		ID: "acct-1", Label: "home-gmail", AddedAt: time.Now(),
 	}); err != nil {
 		t.Fatalf("register account in manifest: %v", err)
 	}
@@ -53,8 +53,8 @@ func TestCompleteConsentRejectsDuplicateLabelBeforeAnyNetworkCall(t *testing.T) 
 	// checking the label, this would nil-pointer-dereference instead of
 	// returning the "already registered" error, so this test also proves
 	// checkLabelAvailable runs first.
-	if err := p.manifest.AddAccount(ctx, manifest.Account{
-		ID: "acct-1", Label: "home-gmail", TokenPath: "unused", AddedAt: time.Now(),
+	if err := p.manifest.AddAccount(ctx, p.userID, manifest.Account{
+		ID: "acct-1", Label: "home-gmail", AddedAt: time.Now(),
 	}); err != nil {
 		t.Fatalf("register account in manifest: %v", err)
 	}

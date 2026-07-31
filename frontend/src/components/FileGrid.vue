@@ -16,7 +16,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
-import { Download, Trash2, HardDrive, FileX, AlertCircle } from '@lucide/vue'
+import { Download, Trash2, HardDrive, FileX, AlertCircle, AlertTriangle } from '@lucide/vue'
 
 const files = useFilesStore()
 const pendingDelete = ref<VirtualFile | null>(null)
@@ -25,9 +25,9 @@ function download(file: VirtualFile) {
   window.location.href = api.downloadUrl(file.name)
 }
 
-async function confirmDelete(purge: boolean) {
+async function confirmDelete() {
   if (!pendingDelete.value) return
-  await files.remove(pendingDelete.value.name, purge)
+  await files.remove(pendingDelete.value.name)
   pendingDelete.value = null
 }
 </script>
@@ -96,16 +96,27 @@ async function confirmDelete(purge: boolean) {
           >
             <td class="max-w-0 px-4 py-3">
               <div class="truncate font-medium">{{ f.name }}</div>
-              <Badge v-if="f.status !== 'complete'" variant="outline" class="mt-1 text-[10px]">
-                {{ f.status }}
-              </Badge>
+              <div class="mt-1 flex flex-wrap gap-1">
+                <Badge v-if="f.status !== 'complete'" variant="outline" class="text-[10px]">
+                  {{ f.status }}
+                </Badge>
+                <Badge
+                  v-if="f.degraded"
+                  variant="destructive"
+                  class="gap-1 text-[10px]"
+                  title="The drive holding one or more chunks of this file was disconnected. Reconnect that same Google account to restore access."
+                >
+                  <AlertTriangle class="size-3" />
+                  unavailable
+                </Badge>
+              </div>
             </td>
             <td class="px-4 py-3">
               <div class="flex flex-wrap gap-1">
                 <Badge
                   v-for="drive in f.accounts"
                   :key="drive"
-                  variant="secondary"
+                  :variant="drive === 'disconnected' ? 'destructive' : 'secondary'"
                   class="gap-1 font-mono text-[10px] font-normal"
                 >
                   <HardDrive class="size-3" />
@@ -119,7 +130,14 @@ async function confirmDelete(purge: boolean) {
             </td>
             <td class="px-4 py-3">
               <div class="flex justify-end gap-1 opacity-60 transition-opacity group-hover:opacity-100">
-                <Button variant="ghost" size="icon" class="size-8" title="Download" @click="download(f)">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  class="size-8"
+                  :disabled="f.degraded"
+                  :title="f.degraded ? 'Unavailable — reconnect the disconnected drive to restore access' : 'Download'"
+                  @click="download(f)"
+                >
                   <Download class="size-4" />
                 </Button>
                 <Button
@@ -152,15 +170,14 @@ async function confirmDelete(purge: boolean) {
         <AlertDialogHeader>
           <AlertDialogTitle>Delete "{{ pendingDelete?.name }}"?</AlertDialogTitle>
           <AlertDialogDescription>
-            Remove just hides it from your file list but keeps the encrypted chunks on your
-            drives. Delete permanently also deletes those remote chunks — this can't be undone.
+            This deletes the encrypted chunks from your Drive accounts too — this can't be
+            undone.
           </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
           <AlertDialogCancel>Cancel</AlertDialogCancel>
-          <Button variant="secondary" @click="confirmDelete(false)">Remove</Button>
-          <AlertDialogAction class="bg-destructive hover:bg-destructive/90" @click="confirmDelete(true)">
-            Delete permanently
+          <AlertDialogAction class="bg-destructive hover:bg-destructive/90" @click="confirmDelete">
+            Delete
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>

@@ -1,9 +1,9 @@
 // Package drivepool pools multiple Google Drive accounts into one virtual
 // storage volume: registered accounts are placement candidates, files are
 // encrypted, split into fixed-size chunks, and each chunk is uploaded to
-// whichever account currently has the most free space, and a local SQLite
-// manifest maps virtual file names back to the remote chunks that hold
-// their bytes.
+// whichever account currently has the most free space, and a shared
+// Postgres manifest maps virtual file names back to the remote chunks that
+// hold their bytes — scoped per user (see Pool.userID / manifest.scoped).
 package drivepool
 
 import (
@@ -27,6 +27,13 @@ import (
 	"golang.org/x/oauth2"
 )
 
+// ErrAccountInUse is returned by RemoveAccount when the account still holds
+// chunks for at least one non-deleted virtual file and force wasn't set —
+// disconnecting it would make that file's data unreachable, since a chunk's
+// only record of where its bytes live is chunks.account_id, and nothing
+// else in the pool can rediscover a lost account/remote-file pairing.
+var ErrAccountInUse = errors.New("drivepool: account still holds file data")
+
 // DefaultChunkSize is used when Pool.ChunkSize is unset (zero).
 const DefaultChunkSize = 128 << 20 // 128 MiB
 
@@ -35,9 +42,9 @@ const defaultMaxParallelUploads = 4
 
 // Account is a registered Drive account: a placement candidate for Put and
 // the source for Get. initErr is set when the account's client couldn't be
-// built (e.g. a revoked/expired token) — such accounts are skipped by
-// placement and reported unhealthy by ListAccounts, never crash an
-// operation outright.
+// built (e.g. a revoked/expired token, or an undecryptable stored token) —
+// such accounts are skipped by placement and reported unhealthy by
+// ListAccounts, never crash an operation outright.
 type Account struct {
 	ID      string
 	Label   string
@@ -45,9 +52,15 @@ type Account struct {
 	initErr error
 }
 
+// Pool is scoped to exactly one user for its whole lifetime — userID is set
+// once at construction (Open) and threaded into every manifest call
+// internally, so callers (CLI commands, backend handlers) never pass it
+// themselves. This mirrors how a Pool was already used in practice before
+// the multi-tenant migration: one CLI process operates as one user, and the
+// backend's poolCache already built one Pool per portal user.
 type Pool struct {
 	manifest  *manifest.Manifest
-	tokens    *auth.TokenStore
+	userID    string
 	clientCfg *oauth2.Config
 
 	// newClient builds a RemoteStore from a token source; overridden in
@@ -76,13 +89,14 @@ func (p *Pool) maxParallelUploads() int {
 	return defaultMaxParallelUploads
 }
 
-// Open loads every account already registered in m and builds a Drive
-// client for each. An account whose token can't be loaded or refreshed is
-// kept in the pool with initErr set, rather than failing Open entirely.
-func Open(ctx context.Context, m *manifest.Manifest, tokens *auth.TokenStore, clientCfg *oauth2.Config) (*Pool, error) {
+// Open loads every account userID already has registered in m and builds a
+// Drive client for each. An account whose token can't be decrypted or
+// refreshed is kept in the pool with initErr set, rather than failing Open
+// entirely.
+func Open(ctx context.Context, m *manifest.Manifest, userID string, clientCfg *oauth2.Config) (*Pool, error) {
 	p := &Pool{
 		manifest:  m,
-		tokens:    tokens,
+		userID:    userID,
 		clientCfg: clientCfg,
 		newClient: func(ctx context.Context, ts oauth2.TokenSource) (gdrive.RemoteStore, error) {
 			return gdrive.NewClient(ctx, ts)
@@ -90,33 +104,27 @@ func Open(ctx context.Context, m *manifest.Manifest, tokens *auth.TokenStore, cl
 		accounts: make(map[string]*Account),
 	}
 
-	rows, err := m.ListAccounts(ctx)
+	rows, err := m.ListAccounts(ctx, userID)
 	if err != nil {
 		return nil, fmt.Errorf("drivepool: list accounts: %w", err)
 	}
 
 	for _, row := range rows {
-		p.accounts[row.ID] = p.buildAccount(ctx, row.ID, row.Label)
+		p.accounts[row.ID] = p.buildAccount(ctx, row)
 	}
 
 	return p, nil
 }
 
-// Close releases the pool's underlying manifest database handle.
-func (p *Pool) Close() error {
-	return p.manifest.Close()
-}
+func (p *Pool) buildAccount(ctx context.Context, row manifest.Account) *Account {
+	a := &Account{ID: row.ID, Label: row.Label}
 
-func (p *Pool) buildAccount(ctx context.Context, id, label string) *Account {
-	a := &Account{ID: id, Label: label}
-
-	tok, err := p.tokens.Load(label)
-	if err != nil {
-		a.initErr = fmt.Errorf("load token: %w", err)
+	if row.Token == nil {
+		a.initErr = fmt.Errorf("load token: stored token could not be decrypted")
 		return a
 	}
 
-	ts := p.clientCfg.TokenSource(ctx, tok)
+	ts := p.clientCfg.TokenSource(ctx, row.Token)
 	store, err := p.newClient(ctx, ts)
 	if err != nil {
 		a.initErr = fmt.Errorf("init client: %w", err)
@@ -130,10 +138,11 @@ func (p *Pool) buildAccount(ctx context.Context, id, label string) *Account {
 // AddAccount runs the CLI's interactive loopback OAuth consent flow
 // (auth.RunConsentFlow: bind a local port, print a URL, block waiting for
 // the browser to redirect back to that port) for a new account label,
-// persists its token, queries its starting quota, and registers it in the
-// manifest. This only works when the caller and the browser completing
-// consent are the same machine — see AuthCodeURL/CompleteConsent for the
-// web-redirect equivalent a remote HTTP backend needs instead.
+// queries its starting quota, and registers it in the manifest (token
+// included, encrypted at rest — see manifest.Manifest). This only works
+// when the caller and the browser completing consent are the same machine
+// — see AuthCodeURL/CompleteConsent for the web-redirect equivalent a
+// remote HTTP backend needs instead.
 func (p *Pool) AddAccount(ctx context.Context, label string) (*Account, error) {
 	if err := p.checkLabelAvailable(ctx, label); err != nil {
 		return nil, err
@@ -160,7 +169,16 @@ func (p *Pool) AddAccount(ctx context.Context, label string) (*Account, error) {
 func (p *Pool) AuthCodeURL(redirectURL, state string) string {
 	cfg := *p.clientCfg
 	cfg.RedirectURL = redirectURL
-	return cfg.AuthCodeURL(state, oauth2.AccessTypeOffline)
+	// prompt=select_account forces Google's account chooser even when the
+	// browser already has an active session, so connecting a second account
+	// doesn't silently re-authorize whichever one is currently signed in.
+	// consent must be requested alongside it — Google only issues a
+	// refresh_token on an account's first grant to this app; a bare
+	// select_account re-auth for an already-authorized account can return
+	// an access token with no refresh_token, which then works for about an
+	// hour and fails permanently ("refresh token is not set") once it
+	// expires, with no way to recover short of reconnecting from scratch.
+	return cfg.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.SetAuthURLParam("prompt", "select_account consent"))
 }
 
 // CompleteConsent exchanges an authorization code obtained via
@@ -187,7 +205,7 @@ func (p *Pool) CompleteConsent(ctx context.Context, redirectURL, code, label str
 // registered labels) rather than the in-memory p.accounts map, which is
 // keyed by generated account ID, not label.
 func (p *Pool) checkLabelAvailable(ctx context.Context, label string) error {
-	_, err := p.manifest.GetAccount(ctx, label)
+	_, err := p.manifest.GetAccount(ctx, p.userID, label)
 	if err == nil {
 		return fmt.Errorf("drivepool: account label %q already registered", label)
 	}
@@ -202,8 +220,8 @@ func (p *Pool) checkLabelAvailable(ctx context.Context, label string) error {
 // manifest — shared by AddAccount (CLI, token from the loopback flow) and
 // CompleteConsent (web backend, token from a code exchange).
 func (p *Pool) finishAddAccount(ctx context.Context, label string, tok *oauth2.Token) (*Account, error) {
-	if err := p.tokens.Save(label, tok); err != nil {
-		return nil, fmt.Errorf("drivepool: save token: %w", err)
+	if tok.RefreshToken == "" {
+		return nil, fmt.Errorf("drivepool: Google didn't return a refresh token for %q — the account would work for about an hour and then fail permanently. Try again; if it keeps happening, revoke this app's access at myaccount.google.com/permissions and reconnect", label)
 	}
 
 	ts := p.clientCfg.TokenSource(ctx, tok)
@@ -219,15 +237,15 @@ func (p *Pool) finishAddAccount(ctx context.Context, label string, tok *oauth2.T
 
 	id := storage.GenerateID()
 	now := time.Now().UTC()
-	if err := p.manifest.AddAccount(ctx, manifest.Account{
-		ID:        id,
-		Label:     label,
-		TokenPath: p.tokens.Path(label),
-		AddedAt:   now,
+	if err := p.manifest.AddAccount(ctx, p.userID, manifest.Account{
+		ID:      id,
+		Label:   label,
+		Token:   tok,
+		AddedAt: now,
 	}); err != nil {
 		return nil, fmt.Errorf("drivepool: register account: %w", err)
 	}
-	if err := p.manifest.UpdateAccountQuota(ctx, id, quota.Limit, quota.Usage, now); err != nil {
+	if err := p.manifest.UpdateAccountQuota(ctx, p.userID, id, quota.Limit, quota.Usage, now); err != nil {
 		return nil, fmt.Errorf("drivepool: record quota: %w", err)
 	}
 
@@ -236,12 +254,27 @@ func (p *Pool) finishAddAccount(ctx context.Context, label string, tok *oauth2.T
 	return a, nil
 }
 
-func (p *Pool) RemoveAccount(ctx context.Context, label string) error {
-	row, err := p.manifest.GetAccount(ctx, label)
+// RemoveAccount disconnects label. If it still holds chunks for any
+// non-deleted file, removal is refused (ErrAccountInUse) unless force is
+// set — those chunks' only pointer back to their remote Drive file would
+// otherwise be lost the moment the account leaves the manifest. When force
+// is set, the database itself nulls out those chunks' account_id (ON
+// DELETE SET NULL) rather than leaving a dangling reference.
+func (p *Pool) RemoveAccount(ctx context.Context, label string, force bool) error {
+	row, err := p.manifest.GetAccount(ctx, p.userID, label)
 	if err != nil {
 		return err
 	}
-	if err := p.manifest.RemoveAccount(ctx, label); err != nil {
+	if !force {
+		n, err := p.manifest.CountActiveChunks(ctx, p.userID, row.ID)
+		if err != nil {
+			return fmt.Errorf("drivepool: check account usage: %w", err)
+		}
+		if n > 0 {
+			return fmt.Errorf("%w: %q still holds %d chunk(s) from file(s) that would become unrecoverable", ErrAccountInUse, label, n)
+		}
+	}
+	if err := p.manifest.RemoveAccount(ctx, p.userID, label); err != nil {
 		return err
 	}
 	delete(p.accounts, row.ID)
@@ -256,11 +289,12 @@ type AccountStatus struct {
 	Unlimited bool
 	Limit     int64
 	Usage     int64
+	PhotoURL  string
 	Err       error // set if this account's quota couldn't be refreshed
 }
 
 func (p *Pool) ListAccountStatus(ctx context.Context) ([]AccountStatus, error) {
-	rows, err := p.manifest.ListAccounts(ctx)
+	rows, err := p.manifest.ListAccounts(ctx, p.userID)
 	if err != nil {
 		return nil, err
 	}
@@ -287,6 +321,7 @@ func (p *Pool) ListAccountStatus(ctx context.Context) ([]AccountStatus, error) {
 
 		st.Limit, st.Usage, st.Unlimited = q.Limit, q.Usage, q.Unlimited
 		st.Available = q.Available()
+		st.PhotoURL = q.PhotoURL
 		out = append(out, st)
 	}
 	return out, nil
@@ -469,16 +504,17 @@ func (p *Pool) PutStream(ctx context.Context, r io.Reader, size int64, virtualNa
 		FileKey:     fileKey,
 		Status:      manifest.StatusIncomplete,
 	}
-	if err := p.manifest.CreateVirtualFile(ctx, vf); err != nil {
+	if err := p.manifest.CreateVirtualFile(ctx, p.userID, vf); err != nil {
 		p.cleanupChunks(ctx, uploaded)
 		return fmt.Errorf("drivepool: record virtual file: %w", err)
 	}
 
 	for _, uc := range uploaded {
-		if err := p.manifest.AddChunk(ctx, &manifest.Chunk{
+		accountID := uc.accountID
+		if err := p.manifest.AddChunk(ctx, p.userID, &manifest.Chunk{
 			VirtualFileID:   vf.ID,
 			Index:           uc.index,
-			AccountID:       uc.accountID,
+			AccountID:       &accountID,
 			RemoteFileID:    uc.remoteFileID,
 			RemoteFolderID:  uc.remoteFolderID,
 			PlaintextSize:   uc.plaintextSize,
@@ -489,7 +525,7 @@ func (p *Pool) PutStream(ctx context.Context, r io.Reader, size int64, virtualNa
 		}
 	}
 
-	return p.manifest.SetVirtualFileStatus(ctx, vf.ID, manifest.StatusComplete)
+	return p.manifest.SetVirtualFileStatus(ctx, p.userID, vf.ID, manifest.StatusComplete)
 }
 
 // uploadChunk encrypts one chunk's plaintext entirely in memory (no local
@@ -571,12 +607,12 @@ func (p *Pool) Get(ctx context.Context, virtualName, destPath string) error {
 // finish out of order while the single writer below drains channel 0,
 // then 1, then 2, ...
 func (p *Pool) GetStream(ctx context.Context, virtualName string, w io.Writer) error {
-	vf, err := p.manifest.GetVirtualFile(ctx, virtualName)
+	vf, err := p.manifest.GetVirtualFile(ctx, p.userID, virtualName)
 	if err != nil {
 		return err
 	}
 
-	chunks, err := p.manifest.ListChunks(ctx, vf.ID)
+	chunks, err := p.manifest.ListChunks(ctx, p.userID, vf.ID)
 	if err != nil {
 		return err
 	}
@@ -647,7 +683,10 @@ func (p *Pool) GetStream(ctx context.Context, virtualName string, w io.Writer) e
 // downloadChunk downloads and decrypts one chunk, verifying it against its
 // own recorded plaintext hash before handing the bytes back.
 func (p *Pool) downloadChunk(ctx context.Context, fileKey []byte, chunk manifest.Chunk) ([]byte, error) {
-	a, ok := p.accounts[chunk.AccountID]
+	if chunk.AccountID == nil {
+		return nil, fmt.Errorf("drivepool: chunk %d's account is unavailable", chunk.Index)
+	}
+	a, ok := p.accounts[*chunk.AccountID]
 	if !ok || a.initErr != nil {
 		return nil, fmt.Errorf("drivepool: chunk %d's account is unavailable", chunk.Index)
 	}
@@ -671,7 +710,7 @@ func (p *Pool) downloadChunk(ctx context.Context, fileKey []byte, chunk manifest
 }
 
 func (p *Pool) List(ctx context.Context, prefix string) ([]manifest.VirtualFile, error) {
-	return p.manifest.ListVirtualFiles(ctx, prefix)
+	return p.manifest.ListVirtualFiles(ctx, p.userID, prefix)
 }
 
 // FileInfo is a virtual file plus the labels of every account currently
@@ -681,6 +720,10 @@ func (p *Pool) List(ctx context.Context, prefix string) ([]manifest.VirtualFile,
 type FileInfo struct {
 	manifest.VirtualFile
 	Accounts []string
+	// Degraded is true if at least one chunk's account has been
+	// disconnected — the file may be partially or fully unrecoverable
+	// until that account (or one holding the same data) is reconnected.
+	Degraded bool
 }
 
 // ListWithAccounts is List plus, for each file, the deduplicated labels of
@@ -688,55 +731,68 @@ type FileInfo struct {
 // on the plain List above) — kept separate so List's existing behavior
 // and callers are untouched.
 func (p *Pool) ListWithAccounts(ctx context.Context, prefix string) ([]FileInfo, error) {
-	files, err := p.manifest.ListVirtualFiles(ctx, prefix)
+	files, err := p.manifest.ListVirtualFiles(ctx, p.userID, prefix)
 	if err != nil {
 		return nil, err
 	}
 
 	out := make([]FileInfo, 0, len(files))
 	for _, f := range files {
-		chunks, err := p.manifest.ListChunks(ctx, f.ID)
+		chunks, err := p.manifest.ListChunks(ctx, p.userID, f.ID)
 		if err != nil {
 			return nil, err
 		}
 
 		seen := make(map[string]bool, len(chunks))
 		labels := make([]string, 0, len(chunks))
+		degraded := false
 		for _, c := range chunks {
-			if seen[c.AccountID] {
+			key := "" // dedup key; every disconnected chunk groups under this one entry
+			if c.AccountID != nil {
+				key = *c.AccountID
+			}
+			if seen[key] {
 				continue
 			}
-			seen[c.AccountID] = true
+			seen[key] = true
 
-			label := c.AccountID // fall back to the raw ID if the account was since removed
-			if a, ok := p.accounts[c.AccountID]; ok {
-				label = a.Label
+			var a *Account
+			if c.AccountID != nil {
+				a = p.accounts[*c.AccountID]
 			}
-			labels = append(labels, label)
+			if a == nil {
+				degraded = true
+				labels = append(labels, "disconnected")
+				continue
+			}
+			labels = append(labels, a.Label)
 		}
 
-		out = append(out, FileInfo{VirtualFile: f, Accounts: labels})
+		out = append(out, FileInfo{VirtualFile: f, Accounts: labels, Degraded: degraded})
 	}
 	return out, nil
 }
 
 func (p *Pool) Remove(ctx context.Context, virtualName string, purge bool) error {
 	if purge {
-		vf, err := p.manifest.GetVirtualFile(ctx, virtualName)
+		vf, err := p.manifest.GetVirtualFile(ctx, p.userID, virtualName)
 		if err != nil {
 			return err
 		}
-		chunks, err := p.manifest.ListChunks(ctx, vf.ID)
+		chunks, err := p.manifest.ListChunks(ctx, p.userID, vf.ID)
 		if err != nil {
 			return err
 		}
 		for _, chunk := range chunks {
-			if a, ok := p.accounts[chunk.AccountID]; ok && a.initErr == nil {
+			if chunk.AccountID == nil {
+				continue
+			}
+			if a, ok := p.accounts[*chunk.AccountID]; ok && a.initErr == nil {
 				if err := a.Store.Delete(ctx, chunk.RemoteFileID); err != nil {
 					return fmt.Errorf("drivepool: delete remote chunk %d: %w", chunk.Index, err)
 				}
 			}
 		}
 	}
-	return p.manifest.DeleteVirtualFile(ctx, virtualName, purge)
+	return p.manifest.DeleteVirtualFile(ctx, p.userID, virtualName, purge)
 }

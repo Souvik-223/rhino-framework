@@ -5,9 +5,6 @@ import { UploadCloud, Plus } from '@lucide/vue'
 
 const files = useFilesStore()
 const dragging = ref(false)
-// dragenter/dragleave fire again for every child element the pointer
-// crosses, so a plain boolean flickers off mid-drag — a depth counter
-// only reaches zero when the pointer truly leaves the window.
 let depth = 0
 
 function onDragEnter(e: DragEvent) {

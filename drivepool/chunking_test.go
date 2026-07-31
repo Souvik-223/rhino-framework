@@ -22,11 +22,11 @@ func TestPutStreamSplitsAcrossAccountsAndRoundTrips(t *testing.T) {
 		t.Fatalf("PutStream: %v", err)
 	}
 
-	vf, err := p.manifest.GetVirtualFile(ctx, "big.bin")
+	vf, err := p.manifest.GetVirtualFile(ctx, p.userID, "big.bin")
 	if err != nil {
 		t.Fatalf("GetVirtualFile: %v", err)
 	}
-	chunks, err := p.manifest.ListChunks(ctx, vf.ID)
+	chunks, err := p.manifest.ListChunks(ctx, p.userID, vf.ID)
 	if err != nil {
 		t.Fatalf("ListChunks: %v", err)
 	}
@@ -36,7 +36,9 @@ func TestPutStreamSplitsAcrossAccountsAndRoundTrips(t *testing.T) {
 
 	usedAccounts := make(map[string]bool)
 	for _, c := range chunks {
-		usedAccounts[c.AccountID] = true
+		if c.AccountID != nil {
+			usedAccounts[*c.AccountID] = true
+		}
 	}
 	if !usedAccounts["acct-a"] || !usedAccounts["acct-b"] {
 		t.Errorf("want chunks spread across both accounts, got accounts: %+v", usedAccounts)
@@ -76,7 +78,7 @@ func TestPutStreamFailureCleansUpUploadedChunks(t *testing.T) {
 		t.Errorf("want no orphaned chunks left on acct-ok after cleanup, got %d", len(okStore.files))
 	}
 
-	if _, err := p.manifest.GetVirtualFile(ctx, "will-fail.bin"); err != manifest.ErrNotFound {
+	if _, err := p.manifest.GetVirtualFile(ctx, p.userID, "will-fail.bin"); err != manifest.ErrNotFound {
 		t.Errorf("want no virtual file recorded after a failed Put, got err=%v", err)
 	}
 }

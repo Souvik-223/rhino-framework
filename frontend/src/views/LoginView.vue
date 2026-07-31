@@ -55,7 +55,7 @@ async function submit() {
           Rhino
         </div>
         <p class="font-heading text-muted-foreground text-[10px] font-semibold tracking-[0.2em] uppercase">
-          Storage
+          Merge
         </p>
         <p class="text-muted-foreground pt-1 text-sm">Sign in to your pooled drive vault</p>
       </CardHeader>

@@ -7,6 +7,7 @@ import { useFilesStore } from "../stores/files";
 import { useTheme } from "../composables/useTheme";
 import { formatBytes } from "../composables/useBytes";
 import { Button } from "@/components/ui/button";
+import { SidebarTrigger } from "@/components/ui/sidebar";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -24,8 +25,6 @@ const files = useFilesStore();
 const router = useRouter();
 const { theme, toggle } = useTheme();
 
-// Same aggregation `rhino status` does client-side from ListAccountStatus —
-// no separate backend endpoint needed for numbers already in these stores.
 const totals = computed(() => {
   let healthy = 0;
   let total = 0;
@@ -61,6 +60,8 @@ async function logout() {
   <header
     class="bg-background border-border/60 relative z-10 flex items-center gap-4 border-b px-6 py-3"
   >
+    <SidebarTrigger />
+
     <div class="relative max-w-sm flex-1">
       <Search
         class="text-muted-foreground pointer-events-none absolute top-1/2 left-3 size-3.5 -translate-y-1/2"

@@ -1,8 +1,3 @@
-// Thin fetch wrapper for the backend's JSON API. Every call sends
-// credentials so the session cookie (set by /api/auth/login) travels with
-// the request, and throws ApiError on any non-2xx response so callers can
-// just await and catch.
-
 export class ApiError extends Error {
   status: number
   constructor(status: number, message: string) {
@@ -28,9 +23,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     try {
       const body = await res.json()
       if (body?.error) message = body.error
-    } catch {
-      // response body wasn't JSON — fall back to statusText
-    }
+    } catch {}
     throw new ApiError(res.status, message)
   }
 
@@ -48,6 +41,7 @@ export interface AccountStatus {
   usage?: number
   available?: number
   unlimited?: boolean
+  photoUrl?: string
   error?: string
 }
 
@@ -56,7 +50,8 @@ export interface VirtualFile {
   size: number
   status: string
   modifiedAt: string
-  accounts: string[] // which drive(s) this file's chunks are stored on
+  accounts: string[]
+  degraded: boolean
 }
 
 export const api = {
@@ -78,14 +73,10 @@ export const api = {
 
   listAccounts: () => request<AccountStatus[]>('/accounts'),
 
-  // Connecting an account is a real OAuth consent screen, not a JSON
-  // exchange — the caller must navigate the browser to this URL
-  // (window.location.href = ...), not fetch() it, so the browser itself
-  // follows the redirect chain to Google and back to /api/accounts/oauth/callback.
   connectAccountUrl: (label: string) => `/api/accounts/connect?label=${encodeURIComponent(label)}`,
 
-  removeAccount: (label: string) =>
-    request<void>(`/accounts/${encodeURIComponent(label)}`, { method: 'DELETE' }),
+  removeAccount: (label: string, force = false) =>
+    request<void>(`/accounts/${encodeURIComponent(label)}?force=${force}`, { method: 'DELETE' }),
 
   listFiles: (prefix = '') =>
     request<VirtualFile[]>(`/files${prefix ? `?prefix=${encodeURIComponent(prefix)}` : ''}`),
@@ -108,9 +99,7 @@ export const api = {
           let message = xhr.statusText
           try {
             message = JSON.parse(xhr.responseText)?.error ?? message
-          } catch {
-            // ignore non-JSON error bodies
-          }
+          } catch {}
           reject(new ApiError(xhr.status, message))
         }
       }

@@ -83,7 +83,11 @@ func RunConsentFlow(ctx context.Context, cfg *oauth2.Config) (*oauth2.Token, err
 	go srv.Serve(listener)
 	defer srv.Shutdown(context.Background())
 
-	authURL := cfgCopy.AuthCodeURL(state, oauth2.AccessTypeOffline)
+	// consent alongside select_account: Google only issues a refresh_token
+	// on an account's first grant, so a bare select_account re-auth for an
+	// already-authorized account can silently come back with no
+	// refresh_token — see pool.go's AuthCodeURL for the failure mode.
+	authURL := cfgCopy.AuthCodeURL(state, oauth2.AccessTypeOffline, oauth2.SetAuthURLParam("prompt", "select_account consent"))
 	fmt.Printf("Open this URL to authorize access:\n\n%s\n\nWaiting on %s ...\n", authURL, redirectURL)
 
 	select {

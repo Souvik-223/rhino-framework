@@ -5,39 +5,57 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"strings"
+
+	rhinodb "github.com/Souvik-223/rhino-framework/db"
+	"github.com/Souvik-223/rhino-framework/drivepool"
 )
 
-// Config configures a Server. BaseDataDir holds users.db and a users/<id>/
-// subtree per portal user (see plans/web_portal.md §1) — distinct from the
-// CLI's single-directory drivepool.ResolveDataDir layout, even though both
-// are resolved from the same RHINO_DATA_DIR env var in their own contexts.
+// Config configures a Server. Every portal user's data lives in one shared
+// Postgres database (DatabaseURL) — see drivepool/manifest and
+// backend/poolcache.go — rather than a per-user local directory.
 type Config struct {
-	BaseDataDir      string
-	ClientSecretPath string // shared OAuth app credential, one per deployment
-	SessionSecret    []byte
-	SessionSecure    bool   // set the cookie's Secure flag; requires this process (or its reverse proxy) to terminate TLS
-	PublicURL        string // this server's externally-reachable base URL; see handlers_oauth.go
+	DatabaseURL        string
+	TokenEncryptionKey []byte // 32 bytes; encrypts/decrypts stored OAuth tokens, see manifest.Manifest
+	ClientSecretPath   string // shared OAuth app credential, one per deployment
+	SessionSecret      []byte
+	SessionSecure      bool   // set the cookie's Secure flag; requires this process (or its reverse proxy) to terminate TLS
+	PublicURL          string // this server's externally-reachable base URL; see handlers_oauth.go
 }
 
-// ConfigFromEnv builds a Config from RHINO_* environment variables,
-// falling back to defaultBaseDataDir when RHINO_DATA_DIR isn't set.
-func ConfigFromEnv(defaultBaseDataDir string) Config {
-	baseDataDir := defaultBaseDataDir
-	if v := os.Getenv("RHINO_DATA_DIR"); v != "" {
-		baseDataDir = v
+// ConfigFromEnv builds a Config from RHINO_*/DATABASE_URL environment
+// variables. DATABASE_URL and RHINO_TOKEN_ENCRYPTION_KEY have no fallback
+// — unlike the old local-SQLite-file default, there's no reasonable
+// "just works with zero config" default for a shared cloud database or an
+// encryption key, so both are hard requirements here.
+func ConfigFromEnv() (Config, error) {
+	cfg := Config{
+		SessionSecure: os.Getenv("RHINO_SESSION_SECURE") == "1",
+		PublicURL:     "http://localhost:8080", // matches serve.go's default --addr; override for anything else
 	}
 
-	cfg := Config{
-		BaseDataDir:      baseDataDir,
-		ClientSecretPath: filepath.Join(baseDataDir, "client_secret.json"),
-		SessionSecure:    os.Getenv("RHINO_SESSION_SECURE") == "1",
-		PublicURL:        "http://localhost:8080", // matches serve.go's default --addr; override for anything else
+	databaseURL, err := rhinodb.DatabaseURLFromEnv()
+	if err != nil {
+		return Config{}, fmt.Errorf("backend: %w", err)
 	}
+	cfg.DatabaseURL = databaseURL
+
+	key, err := rhinodb.TokenEncryptionKeyFromEnv()
+	if err != nil {
+		return Config{}, fmt.Errorf("backend: %w", err)
+	}
+	cfg.TokenEncryptionKey = key
+
 	if v := os.Getenv("RHINO_CLIENT_SECRET"); v != "" {
 		cfg.ClientSecretPath = v
+	} else {
+		path, err := drivepool.DefaultClientSecretPath()
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.ClientSecretPath = path
 	}
+
 	if v := os.Getenv("RHINO_PUBLIC_URL"); v != "" {
 		cfg.PublicURL = strings.TrimRight(v, "/")
 	}
@@ -51,7 +69,7 @@ func ConfigFromEnv(defaultBaseDataDir string) Config {
 		path := os.Getenv("RHINO_SESSION_SECRET_FILE")
 		b, err := os.ReadFile(path)
 		if err != nil {
-			panic(fmt.Sprintf("backend: read RHINO_SESSION_SECRET_FILE %q: %v", path, err))
+			return Config{}, fmt.Errorf("backend: read RHINO_SESSION_SECRET_FILE %q: %w", path, err)
 		}
 		cfg.SessionSecret = []byte(strings.TrimSpace(string(b)))
 	case os.Getenv("RHINO_SESSION_SECRET") != "":
@@ -61,7 +79,7 @@ func ConfigFromEnv(defaultBaseDataDir string) Config {
 			"every session will be invalidated on restart. Set one in production.")
 		cfg.SessionSecret = randomBytes(32)
 	}
-	return cfg
+	return cfg, nil
 }
 
 func randomBytes(n int) []byte {

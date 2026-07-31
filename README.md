@@ -3,7 +3,7 @@
 Two related distributed-storage subsystems, sharing one on-disk storage/encryption layer:
 
 1. **A peer-to-peer, content-addressable file store** (`server.go`, `p2p/`) — nodes talk to each other over raw TCP, store file content on local disk using a SHA-1 content-addressable path layout, and encrypt every file's bytes with AES-256-CTR before they're written to disk or sent across the wire. A node that doesn't have a file locally can ask its peers for it and stream it back on demand.
-2. **A Google-Drive-pooled storage CLI** (`drivepool/`, `cmd/rhino`) — pools multiple free Google Drive accounts (15GB each) into one virtual storage volume. Each file is encrypted client-side, split into chunks, and each chunk uploaded (concurrently) to whichever registered account currently has the most free space at that moment — so one file's size is no longer capped by any single account's remaining quota. Tracked in a local SQLite manifest. See "Google Drive pooling" below.
+2. **A Google-Drive-pooled storage CLI** (`drivepool/`, `cmd/rhino`) — pools multiple free Google Drive accounts (15GB each) into one virtual storage volume. Each file is encrypted client-side, split into chunks, and each chunk uploaded (concurrently) to whichever registered account currently has the most free space at that moment — so one file's size is no longer capped by any single account's remaining quota. Tracked in a shared Postgres database via GORM (e.g. [Neon](https://neon.tech)), the same one the web portal uses — see "Google Drive pooling" below.
 3. **A multi-user web portal** (`backend/`, `frontend/`, `rhino serve`) — a Google-Drive-like browser UI on top of the same pooling engine: drag-and-drop upload/download, a sidebar showing every connected account and its fill level, and its own login system so multiple people can each pool their own Drive accounts through one deployment. See "Web portal" below.
 
 ## How it works
@@ -25,7 +25,6 @@ This is a from-scratch systems project, and it's mid-build:
 - The compiled binary (`bin/fs`) is currently committed to git. Regenerating it via `make build` will modify a tracked file.
 - No CI/linter config existed for the P2P side originally; `.github/workflows/ci.yml` now runs `go vet`/`go build`/`go test` plus the frontend build/tests on every push, but nothing enforces it locally beyond `make test`/`make vet`.
 - **The web portal's upload/download progress is chunk-level, not byte-level** (a live event per finished chunk, not a smooth progress bar) — true byte-granular progress would need a callback added inside a single chunk's transfer, which isn't built.
-- **Drive tokens aren't encrypted at rest** for the web portal's multi-user deployment — every connected user's OAuth refresh token lives in a file readable by the server process, same as the CLI's single-user model, but the blast radius of a server compromise is now every connected account of every user, not one person's. See `plans/web_portal.md` §5 for the recommended hardening (reusing `storage.CopyEncrypt` under a server-held key) — not yet implemented.
 - **No login rate-limiting** on the portal's `/api/auth/login` yet — worth adding before exposing a deployment publicly.
 - **Chunk replication isn't implemented** — the `chunk_replicas` table exists in the schema, but each chunk still lives on exactly one account, so that account going down fails that file's download. Only the account-spreading part of the original chunking plan is done.
 
@@ -63,27 +62,40 @@ drivepool/               Google Drive multi-account pooling — core domain logi
 │                          and upload/download them concurrently across accounts.
 ├── placement.go           pickAccount (single-chunk, live-queried) + placementTracker (queries
 │                          every account's quota once, then places many chunks from memory).
-├── bootstrap.go            ResolveDataDir / OpenFromDataDir — shared by cmd/rhino and backend/,
-│                          so both are thin callers of the same manifest/token/OAuth bootstrap.
+├── bootstrap.go            DefaultClientSecretPath / OpenWithUser — wires OAuth client config +
+│                          an already-open manifest.Manifest into a Pool for a given userID.
 ├── testing.go              NewPoolForTesting — regular exported helper (not test-gated: a
 │                          separate package's tests can't see export_test.go-style seams) used by
 │                          this package's own tests and by backend/tests.
-├── pool_test.go / chunking_test.go   Tests against a fake in-memory RemoteStore (no real Drive
-│                          calls) — placement, Put/Get round-trip, chunk spreading across accounts,
-│                          partial-failure cleanup, tampered-chunk detection.
+├── pool_test.go / account_test.go / chunking_test.go / fileinfo_test.go   Tests against a fake
+│                          in-memory RemoteStore (no real Drive calls) *and* a real Postgres
+│                          transaction (db/dbtest, rolled back automatically) — placement,
+│                          Put/Get round-trip, chunk spreading across accounts, partial-failure
+│                          cleanup, tampered-chunk detection, cross-tenant isolation.
 ├── auth/
-│   ├── consent.go           RunConsentFlow — OAuth2 loopback-redirect consent flow.
-│   └── tokenstore.go         TokenStore — per-account token persistence (0600 files).
+│   └── consent.go           RunConsentFlow — OAuth2 loopback-redirect consent flow.
 ├── gdrive/
 │   └── client.go             RemoteStore interface + Client — Drive API v3 wrapper
 │                              (EnsureFolder/Upload/Download/Delete/Quota).
 └── manifest/
-    ├── schema.go              SQLite DDL: accounts, virtual_files, chunks, chunk_replicas.
-    └── manifest.go            Manifest — typed queries/inserts over database/sql.
+    ├── models.go              GORM model structs: Account, VirtualFile, Chunk, ChunkReplica.
+    ├── manifest.go            Manifest — GORM queries, all scoped by userID (see scoped()); also
+    │                          handles OAuth token encryption at rest.
+    └── manifest_test.go       Tenant isolation, cascade/set-null FK behavior, token round-trip.
+
+db/                      Shared Postgres connection/migration package — used by both cmd/rhino
+                         and backend/, neither opens its own connection.
+├── db.go                  Open (pooled *gorm.DB, tuned for Neon), IsUniqueViolation,
+│                          DatabaseURLFromEnv/TokenEncryptionKeyFromEnv.
+├── migrate.go             Migrate — applies db/migrations/*.sql via golang-migrate, idempotent,
+│                          run at startup by every entrypoint.
+├── migrations/             Numbered plain-SQL migration files (not GORM AutoMigrate).
+└── dbtest/                 Test-only: OpenTx wraps each test in a rolled-back transaction.
 
 backend/                 Web portal's Gin-based HTTP API (see "Web portal" below).
 ├── server.go              Server/gin.Engine, route table, graceful-shutdown-friendly Router().
-├── config.go              RHINO_* env var resolution (data dir, session secret, TLS).
+├── config.go              RHINO_*/DATABASE_URL env var resolution (Postgres connection, token
+│                          encryption key, session secret, TLS).
 ├── poolcache.go           Per-user *drivepool.Pool cache — lazily opened, idle-evicted.
 ├── middleware.go          Session-verification middleware; userID never trusted from the client.
 ├── handlers_auth.go        register/login/logout/me.
@@ -96,8 +108,8 @@ backend/                 Web portal's Gin-based HTTP API (see "Web portal" below
 │                          limitation as drivepool/testing.go) used by backend/tests.
 ├── dist/                   go:embed target; only index.html is committed as a placeholder —
 │                          `make build-frontend` overwrites this with the real Vite build output.
-├── authdb/                 Separate tiny SQLite DB for portal login accounts (bcrypt-hashed
-│                          passwords) — distinct from each user's own drivepool manifest.
+├── authdb/                 users(id, username, password_hash, created_at) — GORM, same shared
+│                          Postgres database as drivepool/manifest (see db/), distinct table.
 └── tests/                  All backend test cases, as an external package hitting the real
                             Gin router via httptest — see "Testing" below.
 
@@ -116,7 +128,8 @@ frontend/                Vue 3 + Vite SPA — Drive-like dashboard, drag-and-dro
                             see "Testing" below.
 
 cmd/rhino/
-├── main.go                cobra CLI: account add/list/remove, put, get, ls, rm, status.
+├── main.go                cobra CLI: account add/list/remove, put, get, ls, rm, status. Every
+│                          command requires --user/RHINO_USER — no default identity.
 └── serve.go                `rhino serve` — runs the web portal; graceful shutdown on
                             SIGINT/SIGTERM via signal.NotifyContext + http.Server.Shutdown.
 
@@ -132,7 +145,7 @@ Dockerfile / docker-compose.yml / Caddyfile   Container build + reverse-proxy de
 
 - Go 1.25 or newer (`go.mod` currently declares `go 1.25.0`, bumped automatically when the Google API client libraries were added).
 - The P2P side needs no database, environment variables, or external services.
-- The Google Drive pool needs a one-time Google Cloud OAuth setup (free) — see "Google Drive pooling" below. Its local state (SQLite manifest + OAuth tokens) lives under your OS config dir (e.g. `%APPDATA%\rhino` on Windows), not in this repo.
+- The Google Drive pool needs **a Postgres database** (`DATABASE_URL` — [Neon](https://neon.tech)'s free tier works well, or any Postgres 14+) and a one-time Google Cloud OAuth setup (free) — see "Google Drive pooling" below. Every account/file/chunk row lives in that database now; the only thing still resolved to a local file by default is `client_secret.json` (the OAuth app credential), under your OS config dir (e.g. `%APPDATA%\rhino` on Windows).
 - The web portal additionally needs **Node.js 22+** to build the frontend (`make build-frontend`) — only at build time. The resulting `bin/rhino` binary embeds the built assets and needs no Node/npm at runtime.
 
 ## Getting started
@@ -158,11 +171,14 @@ make run           # builds, then runs ./bin/fs — listens on TCP :3000
 ## Running tests
 
 ```bash
+export DATABASE_URL="postgres://postgres:postgres@localhost:5432/rhino_dev?sslmode=disable"  # any real Postgres works; see gudeMD/testing.md §1 for a Podman/Docker one-liner
 make test          # go test ./... -v
 make vet           # go vet ./...
 ```
 
-Covers: CAS path-sharding + store read/write/delete (`storage/store_test.go`), AES encrypt/decrypt round trip (`storage/crypto_test.go`), a TCP transport smoke test (`p2p/tcp_transport_test.go`), and the full `drivepool` `Put`/`Get`/`PutStream`/`GetStream` pipeline — encrypt → chunk → place → upload → download → decrypt → verify, plus chunk placement across accounts, partial-upload-failure cleanup, and tampered-chunk detection (`drivepool/pool_test.go`, `drivepool/chunking_test.go`). All of this runs against a fake in-memory Drive account, so no real Google credentials are needed.
+`drivepool`/`drivepool/manifest`/`backend/tests` all need `DATABASE_URL` pointing at a real Postgres — there's no local zero-config fallback (each test runs inside its own transaction, rolled back automatically, via `db/dbtest`). Without it, those packages' tests `t.Skip` rather than fail. `storage`/`p2p` need nothing.
+
+Covers: CAS path-sharding + store read/write/delete (`storage/store_test.go`), AES encrypt/decrypt round trip (`storage/crypto_test.go`), a TCP transport smoke test (`p2p/tcp_transport_test.go`), and the full `drivepool` `Put`/`Get`/`PutStream`/`GetStream` pipeline — encrypt → chunk → place → upload → download → decrypt → verify, plus chunk placement across accounts, partial-upload-failure cleanup, tampered-chunk detection, and multi-tenant isolation (`drivepool/pool_test.go` and friends, `drivepool/manifest/manifest_test.go`). All of this runs against a fake in-memory Drive account, so no real Google credentials are needed.
 
 `backend/tests` covers the portal's HTTP API the same way — register/login/logout/session enforcement, account listing, and a full upload → list → download → delete round trip — driven via `httptest` against the real Gin router, with a `Pool` wired to the same kind of fake `RemoteStore`. `drivepool/testing.go` and `backend/testing.go` exist specifically to let `backend/tests` (a separate package) build these fixtures, since `Pool`'s and `Server`'s internals are otherwise unexported.
 
@@ -225,21 +241,27 @@ The key wiring detail is `tr.OnPeer = s.OnPeer` — without it, new connections 
 
 ## Google Drive pooling (`rhino` CLI)
 
-`drivepool` treats N registered Google Drive accounts as one pool: `rhino put` encrypts a file with AES-256-CTR (via the same `storage.CopyEncrypt` used by the P2P side), splits it into fixed-size chunks, and uploads each chunk — concurrently, entirely from memory, no local temp file — to whichever registered account currently has the most free space at that moment. `rhino get` reverses this: downloads and decrypts each chunk concurrently (verifying it against its own recorded hash), reassembling them in the correct order, then verifies the whole plaintext against a SHA-256 content hash recorded at upload time. Everything is tracked in a local SQLite manifest (`accounts` / `virtual_files` / `chunks` tables) so `rhino ls`/`status` can report on the pool without touching the network.
+`drivepool` treats N registered Google Drive accounts as one pool: `rhino put` encrypts a file with AES-256-CTR (via the same `storage.CopyEncrypt` used by the P2P side), splits it into fixed-size chunks, and uploads each chunk — concurrently, entirely from memory, no local temp file — to whichever registered account currently has the most free space at that moment. `rhino get` reverses this: downloads and decrypts each chunk concurrently (verifying it against its own recorded hash), reassembling them in the correct order, then verifies the whole plaintext against a SHA-256 content hash recorded at upload time. Everything is tracked in a shared Postgres database (`accounts` / `virtual_files` / `chunks` tables, via GORM — see `db/`) so `rhino ls`/`status` can report on the pool without touching the network, and so the same data is visible whether you access it from the CLI or the web portal.
 
 **Not yet implemented:** chunk replication (storing a chunk on more than one account for redundancy — the `chunk_replicas` table exists in the schema but isn't populated yet), dedup, and versioning.
 
-### One-time setup (per machine, free)
+### One-time setup
 
-1. Go to [console.cloud.google.com](https://console.cloud.google.com), create a project, and enable the **Google Drive API**.
-2. **APIs & Services → OAuth consent screen**: User type **External**, add scope `https://www.googleapis.com/auth/drive.file`, then **publish the app to "In production"**. This one click-through matters: apps left in "Testing" status get refresh tokens that expire after 7 days, forcing weekly re-auth per account. `drive.file` is a non-sensitive scope, so publishing doesn't require Google's full app-verification review — you'll just see (and can dismiss) an "unverified app" warning once per account during consent, which is expected for a personal, non-public tool.
-3. **APIs & Services → Credentials → Create Credentials → OAuth client ID → Desktop app**. Download the JSON.
-4. Save that file as `<config dir>/rhino/client_secret.json` — on Windows, `%APPDATA%\rhino\client_secret.json` (or pass `--credentials <path>` to every `rhino` command instead).
+1. **A Postgres database.** [Neon](https://neon.tech) has a free tier that works well; any Postgres 14+ works. Set `DATABASE_URL` to its connection string (`.env.example` has the exact format). The schema is created automatically on first run — no manual migration step.
+2. **A 32-byte token encryption key** — `openssl rand -hex 32`, set as `RHINO_TOKEN_ENCRYPTION_KEY`. This encrypts every connected account's OAuth token at rest; losing/rotating it means reconnecting every account from scratch.
+3. **Google Cloud OAuth setup (free)**:
+   - Go to [console.cloud.google.com](https://console.cloud.google.com), create a project, and enable the **Google Drive API**.
+   - **APIs & Services → OAuth consent screen**: User type **External**, add scope `https://www.googleapis.com/auth/drive.file`, then **publish the app to "In production"**. This one click-through matters: apps left in "Testing" status get refresh tokens that expire after 7 days, forcing weekly re-auth per account. `drive.file` is a non-sensitive scope, so publishing doesn't require Google's full app-verification review — you'll just see (and can dismiss) an "unverified app" warning once per account during consent, which is expected for a personal, non-public tool.
+   - **APIs & Services → Credentials → Create Credentials → OAuth client ID → Desktop app**. Download the JSON.
+   - Save that file as `<config dir>/rhino/client_secret.json` — on Windows, `%APPDATA%\rhino\client_secret.json` (or pass `--credentials <path>` to every `rhino` command instead).
 
 ### Usage
 
+Every command needs `--user <name>`/`RHINO_USER` to identify whose data it's operating on — there's no default identity. A fresh name auto-provisions a CLI-only identity; pointing it at an existing web-portal username operates on that person's real data.
+
 ```bash
 make build-rhino          # or: go build -o bin/rhino ./cmd/rhino (bin/rhino.exe on Windows PowerShell)
+export RHINO_USER=yourname   # or pass --user yourname to every command below
 
 bin/rhino account add --label home-gmail
 # prints a URL to open in a browser; after you approve access it's captured
@@ -281,13 +303,14 @@ go run ./cmd/rhino serve            # backend on :8080
 cd frontend && npm run dev           # frontend dev server, proxies /api/* to :8080
 ```
 
-Uses the same `client_secret.json` one-time setup as the CLI (see above) — it's a deployment-wide OAuth app credential shared by every portal user, not something each user configures themselves. Without it, registration/login/health checks all work, but connecting a Drive account or listing/uploading files will fail until it's in place.
+Uses the same Postgres database and `client_secret.json` as the CLI (see above) — the OAuth app credential is deployment-wide, shared by every portal user, not something each user configures themselves. Without a `client_secret.json` in place, registration/login/health checks all work, but connecting a Drive account or listing/uploading files will fail until it's there.
 
 Key environment variables (see `.env.example` for the full list):
 
 | Variable | Purpose |
 | --- | --- |
-| `RHINO_DATA_DIR` | Where `users.db` and each user's `users/<id>/` subtree live. Defaults to the same OS config dir the CLI uses. |
+| `DATABASE_URL` / `DATABASE_URL_FILE` | Postgres connection string — every user's accounts/files/chunks and the portal's login accounts all live here. Required. |
+| `RHINO_TOKEN_ENCRYPTION_KEY` / `RHINO_TOKEN_ENCRYPTION_KEY_FILE` | 32 bytes, hex-encoded — encrypts every stored OAuth token at rest. Required. |
 | `RHINO_ADDR` | Address to listen on (default `:8080`); `--addr` overrides. |
 | `RHINO_SESSION_SECRET` / `RHINO_SESSION_SECRET_FILE` | Signs session cookies. Without one, a random key is generated at startup and every session is invalidated on restart — **set this in production**. |
 | `RHINO_CLIENT_SECRET` | Overrides where `client_secret.json` is read from. |
@@ -298,12 +321,14 @@ Key environment variables (see `.env.example` for the full list):
 cp .env.example .env                          # fill in real values
 mkdir -p secrets
 echo -n "$(openssl rand -base64 32)" > secrets/session_secret.txt
+echo -n "postgres://user:pass@your-neon-host/db?sslmode=require" > secrets/database_url.txt
+echo -n "$(openssl rand -hex 32)" > secrets/token_encryption_key.txt
 cp /path/to/your/client_secret.json secrets/client_secret.json
 
 docker compose up -d --build
 ```
 
-`docker-compose.yml` runs the portal behind a `Caddy` reverse proxy that terminates TLS automatically (edit the placeholder domain in `Caddyfile` first) and keeps all durable state — `users.db`, every user's `manifest.db`/tokens — on a named volume. `/healthz` (liveness) and `/readyz` (readiness, checks the login database) are available for a load balancer or orchestrator.
+`docker-compose.yml` runs the portal behind a `Caddy` reverse proxy that terminates TLS automatically (edit the placeholder domain in `Caddyfile` first). All durable state — every user's accounts/files/chunks, and the portal's login accounts — lives in the external Postgres database (`DATABASE_URL`), not on a local volume; there's nothing to back up on the host itself beyond `client_secret.json`. `/healthz` (liveness) and `/readyz` (readiness, checks the database connection) are available for a load balancer or orchestrator.
 
 ### Testing without real Google credentials
 

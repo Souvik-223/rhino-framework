@@ -14,22 +14,21 @@ import (
 	"github.com/Souvik-223/rhino-framework/backend"
 )
 
-// newServeCmd runs the multi-user web portal. It shares configDir()'s
-// resolution with every other command (backend.Config just nests users.db
-// and a users/<id>/ subtree underneath it — see plans/web_portal.md §1);
-// the single-user manifest.db/accounts/ the rest of the CLI uses stay
-// untouched and unread by the portal.
+// newServeCmd runs the multi-user web portal against the same shared
+// Postgres database (DATABASE_URL) every other command uses — every portal
+// user's data lives in that one database now, not a per-installation local
+// directory, so there's nothing left for this command to resolve locally
+// beyond the OAuth client_secret.json (see backend.ConfigFromEnv).
 func newServeCmd() *cobra.Command {
 	var addr, certFile, keyFile string
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Run the web portal (multi-user, drag-and-drop file browser)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			baseDataDir, err := configDir()
+			cfg, err := backend.ConfigFromEnv()
 			if err != nil {
 				return err
 			}
-			cfg := backend.ConfigFromEnv(baseDataDir)
 
 			srv, err := backend.New(cmd.Context(), cfg)
 			if err != nil {

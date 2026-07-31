@@ -1,16 +1,17 @@
 <script setup lang="ts">
-import Sidebar from '../components/Sidebar.vue'
+import AppSidebar from '../components/AppSidebar.vue'
 import TopBar from '../components/TopBar.vue'
+import { SidebarInset, SidebarProvider } from '@/components/ui/sidebar'
 </script>
 
 <template>
-  <div class="flex h-svh">
+  <SidebarProvider class="h-svh">
     <div class="animate-fade-in-up flex h-full">
-      <Sidebar />
+      <AppSidebar />
     </div>
-    <div class="bg-blueprint animate-fade-in-up flex min-w-0 flex-1 flex-col" style="animation-delay: 100ms">
+    <SidebarInset class="bg-blueprint animate-fade-in-up min-w-0" style="animation-delay: 100ms">
       <TopBar />
       <slot />
-    </div>
-  </div>
+    </SidebarInset>
+  </SidebarProvider>
 </template>

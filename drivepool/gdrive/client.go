@@ -23,6 +23,7 @@ type QuotaInfo struct {
 	Limit     int64
 	Usage     int64
 	Unlimited bool
+	PhotoURL  string
 }
 
 func (q QuotaInfo) Available() int64 {
@@ -60,21 +61,29 @@ func NewClient(ctx context.Context, ts oauth2.TokenSource) (*Client, error) {
 
 var _ RemoteStore = (*Client)(nil)
 
-// Quota queries the account's storageQuota via About.get. The Fields call
-// is required — Drive API v3's partial-response mechanism returns nothing
-// useful without it. Usage (not UsageInDrive) is what's actually counted
-// against Limit, since Gmail/Photos share the same quota pool.
+// Quota queries the account's storageQuota and profile photo via About.get
+// in a single call. The Fields call is required — Drive API v3's
+// partial-response mechanism returns nothing useful without it. Usage (not
+// UsageInDrive) is what's actually counted against Limit, since Gmail/Photos
+// share the same quota pool. user.photoLink needs no scope beyond whatever
+// Drive scope is already granted — it's the same account info Drive's own
+// UI shows, not a separate profile/userinfo API.
 func (c *Client) Quota(ctx context.Context) (QuotaInfo, error) {
-	about, err := c.srv.About.Get().Fields("storageQuota").Context(ctx).Do()
+	about, err := c.srv.About.Get().Fields("storageQuota", "user").Context(ctx).Do()
 	if err != nil {
 		return QuotaInfo{}, fmt.Errorf("gdrive: quota: %w", err)
 	}
+	var photoURL string
+	if about.User != nil {
+		photoURL = about.User.PhotoLink
+	}
 	if about.StorageQuota == nil || about.StorageQuota.Limit == 0 {
-		return QuotaInfo{Unlimited: true}, nil
+		return QuotaInfo{Unlimited: true, PhotoURL: photoURL}, nil
 	}
 	return QuotaInfo{
-		Limit: about.StorageQuota.Limit,
-		Usage: about.StorageQuota.Usage,
+		Limit:    about.StorageQuota.Limit,
+		Usage:    about.StorageQuota.Usage,
+		PhotoURL: photoURL,
 	}, nil
 }
 

@@ -1,5 +1,16 @@
 # Web Portal Implementation Plan
 
+> **Note (post-migration):** §1 below ("Why per-user Pool instances, not a
+> shared-schema rewrite") describes the *original* design — one SQLite file
+> per portal user — and its "going with (B)" conclusion. That decision was
+> later reversed: the project moved to option (A), a single shared Postgres
+> database with every table scoped by `user_id`. See
+> [`er_diagram.md`](er_diagram.md) for the current schema and
+> `drivepool/manifest/manifest.go`'s `scoped()` for how tenant isolation
+> works now. The rest of this document (frontend structure, Gin routes,
+> Docker/CI setup, chunking design in §1.2) is unaffected by that change and
+> still describes the real, current implementation.
+
 Adds a browser-based, Google-Drive-like UI on top of `drivepool` (drag-drop
 upload, per-file download/delete, a sidebar showing every connected Drive
 account and its fill level) **without changing any existing CLI behavior**.

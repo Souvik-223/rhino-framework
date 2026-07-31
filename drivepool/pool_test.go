@@ -3,15 +3,19 @@ package drivepool
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/Souvik-223/rhino-framework/db/dbtest"
 	"github.com/Souvik-223/rhino-framework/drivepool/gdrive"
 	"github.com/Souvik-223/rhino-framework/drivepool/manifest"
+	"github.com/Souvik-223/rhino-framework/storage"
 )
 
 // fakeStore is an in-memory RemoteStore so pool/placement logic can be
@@ -86,21 +90,40 @@ func (f *fakeStore) Quota(ctx context.Context) (gdrive.QuotaInfo, error) {
 
 var _ gdrive.RemoteStore = (*fakeStore)(nil)
 
+// newTestPool opens a Postgres transaction (rolled back automatically when
+// the test finishes — see db/dbtest) scoped to a freshly seeded test user,
+// and builds a Pool directly against it. Skips (not fails) if DATABASE_URL
+// isn't set, since there's no local zero-config fallback anymore.
 func newTestPool(t *testing.T) (*Pool, map[string]*fakeStore) {
 	t.Helper()
-	m, err := manifest.Open(filepath.Join(t.TempDir(), "manifest.db"))
-	if err != nil {
-		t.Fatalf("open manifest: %v", err)
-	}
-	t.Cleanup(func() { m.Close() })
+	tx := dbtest.OpenTx(t)
 
-	p := &Pool{manifest: m, accounts: make(map[string]*Account)}
+	userID := storage.GenerateID()
+	if err := tx.Exec(`INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, now())`,
+		userID, userID, "unused").Error; err != nil {
+		t.Fatalf("seed test user: %v", err)
+	}
+
+	m := manifest.New(tx, dbtest.TokenKey())
+	p := &Pool{manifest: m, userID: userID, accounts: make(map[string]*Account)}
 	return p, make(map[string]*fakeStore)
 }
 
+// addFakeAccount registers a fake account both in the in-memory pool (what
+// placement/upload/download actually read) and in the manifest's accounts
+// table (what RemoveAccount/GetAccount query) — a real Pool always has both
+// in sync, and RemoveAccount's guard specifically depends on the manifest
+// row existing.
 func addFakeAccount(t *testing.T, p *Pool, id, label string, limit, usage int64) *fakeStore {
 	t.Helper()
 	fs := newFakeStore(limit, usage)
+	if err := p.manifest.AddAccount(context.Background(), p.userID, manifest.Account{
+		ID:      id,
+		Label:   label,
+		AddedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("add account %q to manifest: %v", label, err)
+	}
 	p.accounts[id] = &Account{ID: id, Label: label, Store: fs}
 	return fs
 }
@@ -211,5 +234,134 @@ func TestPutGetRoundTrip(t *testing.T) {
 	}
 	if len(files) != 0 {
 		t.Errorf("expected no files after tombstone remove, got %+v", files)
+	}
+}
+
+// TestRemoveAccountBlocksWhenChunksActive reproduces the bug report: upload
+// a file, disconnect the account holding its only chunk, then try to
+// download it. Without the guard, RemoveAccount would silently succeed and
+// the later Get would fail with "account unavailable" — a file that looked
+// healthy right up until someone disconnected the wrong drive. The guard
+// should refuse removal up front instead.
+func TestRemoveAccountBlocksWhenChunksActive(t *testing.T) {
+	ctx := context.Background()
+	p, _ := newTestPool(t)
+	addFakeAccount(t, p, "acct-a", "a", 1<<30, 0)
+
+	srcPath := filepath.Join(t.TempDir(), "src.txt")
+	if err := os.WriteFile(srcPath, []byte("data that would be lost"), 0o600); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+	if err := p.Put(ctx, srcPath, "docs/hello.txt"); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	err := p.RemoveAccount(ctx, "a", false)
+	if !errors.Is(err, ErrAccountInUse) {
+		t.Fatalf("want ErrAccountInUse, got %v", err)
+	}
+
+	if _, ok := p.accounts["acct-a"]; !ok {
+		t.Error("account should still be registered after a blocked removal")
+	}
+	if _, err := p.manifest.GetAccount(ctx, p.userID, "a"); err != nil {
+		t.Errorf("account should still be in the manifest after a blocked removal: %v", err)
+	}
+
+	destPath := filepath.Join(t.TempDir(), "dest.txt")
+	if err := p.Get(ctx, "docs/hello.txt", destPath); err != nil {
+		t.Errorf("file should still be downloadable after a blocked removal: %v", err)
+	}
+}
+
+// TestRemoveAccountForceOrphansAndMarksDegraded exercises the explicit
+// escape hatch: force=true still removes the account (matching the CLI's
+// documented "does not delete its remote files" behavior), and the file's
+// chunk is left pointing at a since-removed account. ListWithAccounts must
+// surface that as Degraded rather than silently showing a bare account ID.
+func TestRemoveAccountForceOrphansAndMarksDegraded(t *testing.T) {
+	ctx := context.Background()
+	p, _ := newTestPool(t)
+	addFakeAccount(t, p, "acct-a", "a", 1<<30, 0)
+
+	srcPath := filepath.Join(t.TempDir(), "src.txt")
+	if err := os.WriteFile(srcPath, []byte("data that becomes orphaned"), 0o600); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+	if err := p.Put(ctx, srcPath, "docs/hello.txt"); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	if err := p.RemoveAccount(ctx, "a", true); err != nil {
+		t.Fatalf("force RemoveAccount: %v", err)
+	}
+	if _, ok := p.accounts["acct-a"]; ok {
+		t.Error("account should be gone from the in-memory pool after a forced removal")
+	}
+
+	files, err := p.ListWithAccounts(ctx, "")
+	if err != nil {
+		t.Fatalf("ListWithAccounts: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("want 1 file, got %d", len(files))
+	}
+	if !files[0].Degraded {
+		t.Error("file should be marked Degraded once its only account is gone")
+	}
+	if got := files[0].Accounts; len(got) != 1 || got[0] != "disconnected" {
+		t.Errorf("want [\"disconnected\"] as the account label, got %v", got)
+	}
+}
+
+// TestRemoveAccountAllowedWithoutActiveChunks confirms the guard doesn't
+// block the common, safe case: an account nothing currently depends on.
+func TestRemoveAccountAllowedWithoutActiveChunks(t *testing.T) {
+	ctx := context.Background()
+	p, _ := newTestPool(t)
+	addFakeAccount(t, p, "acct-a", "a", 1<<30, 0)
+
+	if err := p.RemoveAccount(ctx, "a", false); err != nil {
+		t.Fatalf("RemoveAccount on an unused account should succeed, got: %v", err)
+	}
+	if _, err := p.manifest.GetAccount(ctx, p.userID, "a"); !errors.Is(err, manifest.ErrNotFound) {
+		t.Errorf("want manifest.ErrNotFound after removal, got %v", err)
+	}
+}
+
+// TestPoolsAreTenantIsolated confirms two Pools scoped to different users
+// never see each other's accounts or files, even when both exist in the
+// same (shared, transaction-scoped) database — the multi-tenant safety
+// property every manifest query depends on scoped() to provide.
+func TestPoolsAreTenantIsolated(t *testing.T) {
+	ctx := context.Background()
+	pa, _ := newTestPool(t)
+	addFakeAccount(t, pa, "acct-a", "alices-drive", 1<<30, 0)
+	if err := pa.PutStream(ctx, bytes.NewReader([]byte("alice's data")), 12, "secret.txt"); err != nil {
+		t.Fatalf("PutStream as user A: %v", err)
+	}
+
+	// A second Pool, same underlying tx/db, but scoped to a different user
+	// (never seeded into users — reads don't need the FK to be satisfied,
+	// only writes do, and this Pool only reads).
+	pb := &Pool{manifest: pa.manifest, userID: storage.GenerateID(), accounts: make(map[string]*Account)}
+
+	files, err := pb.List(ctx, "")
+	if err != nil {
+		t.Fatalf("List as user B: %v", err)
+	}
+	if len(files) != 0 {
+		t.Errorf("user B should see 0 files, got %d: %+v", len(files), files)
+	}
+
+	if _, err := pb.manifest.GetVirtualFile(ctx, pb.userID, "secret.txt"); !errors.Is(err, manifest.ErrNotFound) {
+		t.Errorf("user B GetVirtualFile: want ErrNotFound, got %v", err)
+	}
+	statuses, err := pb.ListAccountStatus(ctx)
+	if err != nil {
+		t.Fatalf("ListAccountStatus as user B: %v", err)
+	}
+	if len(statuses) != 0 {
+		t.Errorf("user B should see 0 accounts, got %d: %+v", len(statuses), statuses)
 	}
 }

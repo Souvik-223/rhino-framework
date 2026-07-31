@@ -1,0 +1,5 @@
+DROP TABLE IF EXISTS chunk_replicas;
+DROP TABLE IF EXISTS chunks;
+DROP TABLE IF EXISTS virtual_files;
+DROP TABLE IF EXISTS accounts;
+DROP TABLE IF EXISTS users;

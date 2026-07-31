@@ -1,22 +1,21 @@
 // Package authdb persists the web portal's own login accounts — separate
-// from drivepool's per-user manifests, which hold each user's pooled Drive
-// accounts and files. One users.db for the whole deployment, opened once
-// at server startup.
+// from drivepool's per-user domain data (accounts/files/chunks), which
+// lives in its own tables in the same Postgres database (see
+// drivepool/manifest). Both packages share one *gorm.DB, opened once by
+// db.Open/db.Migrate and handed in here — authdb never opens a connection
+// of its own.
 package authdb
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
-	_ "modernc.org/sqlite"
+	"gorm.io/gorm"
 
+	rhinodb "github.com/Souvik-223/rhino-framework/db"
 	"github.com/Souvik-223/rhino-framework/storage"
 )
 
@@ -25,51 +24,33 @@ var (
 	ErrUsernameTaken = errors.New("authdb: username already taken")
 )
 
-const schema = `
-CREATE TABLE IF NOT EXISTS users (
-	id            TEXT PRIMARY KEY,
-	username      TEXT UNIQUE NOT NULL,
-	password_hash TEXT NOT NULL,
-	created_at    DATETIME NOT NULL
-);
-`
-
 type User struct {
-	ID           string
-	Username     string
-	PasswordHash string
-	CreatedAt    time.Time
+	ID           string    `gorm:"primaryKey"`
+	Username     string    `gorm:"not null;uniqueIndex;column:username"`
+	PasswordHash string    `gorm:"not null;column:password_hash"`
+	CreatedAt    time.Time `gorm:"not null;column:created_at"`
 }
+
+func (User) TableName() string { return "users" }
 
 type DB struct {
-	db *sql.DB
+	gdb *gorm.DB
 }
 
-// Open creates (or opens) the SQLite database at path, applying the schema.
-func Open(path string) (*DB, error) {
-	if dir := filepath.Dir(path); dir != "." {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return nil, fmt.Errorf("authdb: create dir: %w", err)
-		}
-	}
-
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		return nil, fmt.Errorf("authdb: open: %w", err)
-	}
-	db.SetMaxOpenConns(1) // modernc.org/sqlite is not safe for concurrent writers on one *DB
-
-	if _, err := db.Exec(schema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("authdb: apply schema: %w", err)
-	}
-	return &DB{db: db}, nil
+// New wraps an already-open, already-migrated *gorm.DB (see db.Open /
+// db.Migrate, called once at process startup).
+func New(gdb *gorm.DB) *DB {
+	return &DB{gdb: gdb}
 }
-
-func (d *DB) Close() error { return d.db.Close() }
 
 // Ping is used by the /readyz health check.
-func (d *DB) Ping(ctx context.Context) error { return d.db.PingContext(ctx) }
+func (d *DB) Ping(ctx context.Context) error {
+	sqlDB, err := d.gdb.DB()
+	if err != nil {
+		return fmt.Errorf("authdb: underlying sql.DB: %w", err)
+	}
+	return sqlDB.PingContext(ctx)
+}
 
 // CreateUser hashes password with bcrypt and registers a new login
 // account. The plaintext password is never stored or logged.
@@ -85,11 +66,8 @@ func (d *DB) CreateUser(ctx context.Context, username, password string) (*User, 
 		PasswordHash: string(hash),
 		CreatedAt:    time.Now().UTC(),
 	}
-	_, err = d.db.ExecContext(ctx, `
-		INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)`,
-		u.ID, u.Username, u.PasswordHash, u.CreatedAt)
-	if err != nil {
-		if isUniqueConstraintErr(err) {
+	if err := d.gdb.WithContext(ctx).Create(u).Error; err != nil {
+		if rhinodb.IsUniqueViolation(err) {
 			return nil, ErrUsernameTaken
 		}
 		return nil, err
@@ -113,32 +91,44 @@ func (d *DB) Authenticate(ctx context.Context, username, password string) (*User
 }
 
 func (d *DB) GetByUsername(ctx context.Context, username string) (*User, error) {
-	row := d.db.QueryRowContext(ctx, `
-		SELECT id, username, password_hash, created_at FROM users WHERE username = ?`, username)
-	return scanUser(row)
-}
-
-func (d *DB) GetByID(ctx context.Context, id string) (*User, error) {
-	row := d.db.QueryRowContext(ctx, `
-		SELECT id, username, password_hash, created_at FROM users WHERE id = ?`, id)
-	return scanUser(row)
-}
-
-type rowScanner interface {
-	Scan(dest ...any) error
-}
-
-func scanUser(row rowScanner) (*User, error) {
 	var u User
-	if err := row.Scan(&u.ID, &u.Username, &u.PasswordHash, &u.CreatedAt); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, ErrNotFound
-		}
+	err := d.gdb.WithContext(ctx).Where("username = ?", username).First(&u).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
 		return nil, err
 	}
 	return &u, nil
 }
 
-func isUniqueConstraintErr(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
+func (d *DB) GetByID(ctx context.Context, id string) (*User, error) {
+	var u User
+	err := d.gdb.WithContext(ctx).Where("id = ?", id).First(&u).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
+
+// GetOrCreateCLIUser resolves username against the shared users table,
+// auto-provisioning a row if none exists yet. The created row's
+// password_hash is a bcrypt hash of a random, immediately-discarded value —
+// structurally valid but never matchable — so a CLI-provisioned identity
+// can never log into the web portal by password. The CLI operates with
+// direct DB trust (no HTTP/session layer), so it needs no password of its
+// own; pointing --user at an existing portal username instead makes the
+// CLI operate on that person's real data, since it's the same users row.
+func (d *DB) GetOrCreateCLIUser(ctx context.Context, username string) (*User, error) {
+	u, err := d.GetByUsername(ctx, username)
+	if err == nil {
+		return u, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return nil, err
+	}
+	return d.CreateUser(ctx, username, storage.GenerateID())
 }

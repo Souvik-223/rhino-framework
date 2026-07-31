@@ -15,9 +15,6 @@ const connectError = ref<string | null>(null)
 onMounted(() => {
   files.refresh()
 
-  // The backend redirects here with ?connect_error= if connecting a Drive
-  // account failed (denied consent, an already-registered label, etc.) —
-  // see backend/handlers_oauth.go's handleOAuthCallback.
   const err = route.query.connect_error
   if (typeof err === 'string' && err) {
     connectError.value = err

@@ -12,13 +12,13 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/Souvik-223/rhino-framework/backend"
 	"github.com/Souvik-223/rhino-framework/backend/authdb"
 	"github.com/Souvik-223/rhino-framework/backend/tests/testutil"
+	"github.com/Souvik-223/rhino-framework/db/dbtest"
 	"github.com/Souvik-223/rhino-framework/drivepool"
 	"github.com/Souvik-223/rhino-framework/drivepool/manifest"
 )
@@ -36,28 +36,21 @@ const (
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
 
-	usersDB, err := authdb.Open(filepath.Join(t.TempDir(), "users.db"))
-	if err != nil {
-		t.Fatalf("open authdb: %v", err)
-	}
-	t.Cleanup(func() { usersDB.Close() })
+	tx := dbtest.OpenTx(t)
+	usersDB := authdb.New(tx)
 
 	user, err := usersDB.CreateUser(context.Background(), fixtureUsername, fixturePassword)
 	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
 
-	m, err := manifest.Open(filepath.Join(t.TempDir(), "manifest.db"))
-	if err != nil {
-		t.Fatalf("open manifest: %v", err)
-	}
-	t.Cleanup(func() { m.Close() })
+	m := manifest.New(tx, dbtest.TokenKey())
 
 	// ListAccountStatus (used by GET /api/accounts) reads the manifest's
 	// accounts table, not the in-memory accounts map below — both need a
 	// matching row for the fake account to show up.
-	if err := m.AddAccount(context.Background(), manifest.Account{
-		ID: "acct-1", Label: "test-account", TokenPath: "unused", AddedAt: time.Now(),
+	if err := m.AddAccount(context.Background(), user.ID, manifest.Account{
+		ID: "acct-1", Label: "test-account", AddedAt: time.Now(),
 	}); err != nil {
 		t.Fatalf("register fake account in manifest: %v", err)
 	}
@@ -66,7 +59,7 @@ func newTestServer(t *testing.T) *httptest.Server {
 	accounts := map[string]*drivepool.Account{
 		"acct-1": {ID: "acct-1", Label: "test-account", Store: fake},
 	}
-	pool := drivepool.NewPoolForTesting(m, accounts)
+	pool := drivepool.NewPoolForTesting(m, user.ID, accounts)
 
 	srv := backend.NewTestServer(usersDB, user.ID, pool, []byte("test-session-secret-32-bytes!!!"))
 	ts := httptest.NewServer(srv.Router())

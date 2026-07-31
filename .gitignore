@@ -20,8 +20,9 @@ backend/dist/*
 .env
 secrets/
 
-# local RHINO_DATA_DIR used for development — client_secret.json, users.db,
-# per-user manifests/tokens all live here, none of it belongs in the repo
+# local dev config dir — just client_secret.json (the OAuth app credential)
+# now that accounts/files/users all live in Postgres (DATABASE_URL) instead
+# of local SQLite files; none of it belongs in the repo either way
 /data
 
 # note: bin/fs and bin/rhino are already tracked without a bin/ entry here

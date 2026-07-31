@@ -1,179 +1,170 @@
-// Package manifest persists the drivepool namespace: registered Drive
-// accounts, virtual files, and the chunks that make them up, in a local
-// SQLite database.
+// Package manifest persists the drivepool namespace — registered Drive
+// accounts, virtual files, and the chunks that make them up — in Postgres,
+// shared by every portal user and the CLI alike. Every per-user table
+// carries a user_id column; see scoped below for how that boundary is
+// enforced on every query.
 package manifest
 
 import (
+	"bytes"
 	"context"
-	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"golang.org/x/oauth2"
+	"gorm.io/gorm"
+
+	rhinodb "github.com/Souvik-223/rhino-framework/db"
+	"github.com/Souvik-223/rhino-framework/storage"
 )
 
-var ErrNotFound = errors.New("manifest: not found")
+var (
+	ErrNotFound   = errors.New("manifest: not found")
+	ErrNameExists = errors.New("manifest: name already exists")
+)
 
 type Manifest struct {
-	db *sql.DB
+	gdb      *gorm.DB
+	tokenKey []byte
 }
 
-// Open creates (or opens) the SQLite database at path, applying the schema.
-func Open(path string) (*Manifest, error) {
-	if dir := filepath.Dir(path); dir != "." {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return nil, fmt.Errorf("manifest: create dir: %w", err)
-		}
-	}
+// New wraps an already-open, already-migrated *gorm.DB (see db.Open /
+// db.Migrate) and a 32-byte key used to encrypt OAuth tokens at rest
+// (storage.CopyEncrypt/CopyDecrypt, AES-256-CTR) — see RHINO_TOKEN_ENCRYPTION_KEY.
+func New(gdb *gorm.DB, tokenEncryptionKey []byte) *Manifest {
+	return &Manifest{gdb: gdb, tokenKey: tokenEncryptionKey}
+}
 
-	db, err := sql.Open("sqlite", path)
+// scoped returns gdb pre-filtered to userID's rows, so every query built
+// from it is tenant-isolated by construction. Every method that reads,
+// updates, or deletes rows in a per-user table must start from this —
+// never m.gdb directly — so a missing filter can't slip in silently.
+// Panics on an empty userID rather than silently matching zero rows: an
+// empty string here means a caller forgot to resolve identity, and that
+// should fail loudly in dev/CI, not look like "no data yet" in production.
+func (m *Manifest) scoped(ctx context.Context, userID string) *gorm.DB {
+	if userID == "" {
+		panic("manifest: scoped called with empty userID")
+	}
+	return m.gdb.WithContext(ctx).Where("user_id = ?", userID)
+}
+
+func (m *Manifest) encryptToken(tok *oauth2.Token) ([]byte, error) {
+	plaintext, err := json.Marshal(tok)
 	if err != nil {
-		return nil, fmt.Errorf("manifest: open: %w", err)
+		return nil, fmt.Errorf("manifest: marshal token: %w", err)
 	}
-	db.SetMaxOpenConns(1) // modernc.org/sqlite is not safe for concurrent writers on one *DB
-
-	if _, err := db.Exec(schema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("manifest: apply schema: %w", err)
+	var ciphertext bytes.Buffer
+	if _, err := storage.CopyEncrypt(m.tokenKey, bytes.NewReader(plaintext), &ciphertext); err != nil {
+		return nil, fmt.Errorf("manifest: encrypt token: %w", err)
 	}
-
-	return &Manifest{db: db}, nil
+	return ciphertext.Bytes(), nil
 }
 
-func (m *Manifest) Close() error {
-	return m.db.Close()
-}
-
-// Path returns the SQLite file's location, following the OS config-dir
-// convention (%APPDATA%\rhino\manifest.db on Windows).
-func Path() (string, error) {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return "", err
+func (m *Manifest) decryptToken(ciphertext []byte) (*oauth2.Token, error) {
+	var plaintext bytes.Buffer
+	if _, err := storage.CopyDecrypt(m.tokenKey, bytes.NewReader(ciphertext), &plaintext); err != nil {
+		return nil, fmt.Errorf("manifest: decrypt token: %w", err)
 	}
-	return filepath.Join(dir, "rhino", "manifest.db"), nil
+	var tok oauth2.Token
+	if err := json.Unmarshal(plaintext.Bytes(), &tok); err != nil {
+		return nil, fmt.Errorf("manifest: unmarshal token: %w", err)
+	}
+	return &tok, nil
 }
 
 // --- accounts ---
 
-type Account struct {
-	ID             string
-	Label          string
-	TokenPath      string
-	AddedAt        time.Time
-	QuotaLimit     int64 // 0 means unlimited or not-yet-queried; see QuotaKnown
-	QuotaUsage     int64
-	QuotaKnown     bool
-	QuotaCheckedAt time.Time
-}
-
-func (m *Manifest) AddAccount(ctx context.Context, a Account) error {
-	_, err := m.db.ExecContext(ctx, `
-		INSERT INTO accounts (id, label, token_path, added_at)
-		VALUES (?, ?, ?, ?)`,
-		a.ID, a.Label, a.TokenPath, a.AddedAt.UTC())
-	return err
-}
-
-func (m *Manifest) RemoveAccount(ctx context.Context, label string) error {
-	res, err := m.db.ExecContext(ctx, `DELETE FROM accounts WHERE label = ?`, label)
+func (m *Manifest) AddAccount(ctx context.Context, userID string, a Account) error {
+	ciphertext, err := m.encryptToken(a.Token)
 	if err != nil {
 		return err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
+	a.UserID = userID
+	a.TokenCiphertext = ciphertext
+	return m.gdb.WithContext(ctx).Create(&a).Error
+}
+
+func (m *Manifest) RemoveAccount(ctx context.Context, userID, label string) error {
+	res := m.scoped(ctx, userID).Where("label = ?", label).Delete(&Account{})
+	if res.Error != nil {
+		return res.Error
 	}
-	if n == 0 {
+	if res.RowsAffected == 0 {
 		return ErrNotFound
 	}
 	return nil
 }
 
-func (m *Manifest) GetAccount(ctx context.Context, label string) (Account, error) {
-	row := m.db.QueryRowContext(ctx, `
-		SELECT id, label, token_path, added_at, quota_limit, quota_usage, quota_checked_at
-		FROM accounts WHERE label = ?`, label)
-	return scanAccount(row)
-}
-
-func (m *Manifest) ListAccounts(ctx context.Context) ([]Account, error) {
-	rows, err := m.db.QueryContext(ctx, `
-		SELECT id, label, token_path, added_at, quota_limit, quota_usage, quota_checked_at
-		FROM accounts ORDER BY label`)
+func (m *Manifest) GetAccount(ctx context.Context, userID, label string) (Account, error) {
+	var a Account
+	err := m.scoped(ctx, userID).Where("label = ?", label).First(&a).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return Account{}, ErrNotFound
+	}
 	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var out []Account
-	for rows.Next() {
-		a, err := scanAccount(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, a)
-	}
-	return out, rows.Err()
-}
-
-func (m *Manifest) UpdateAccountQuota(ctx context.Context, id string, limit, usage int64, checkedAt time.Time) error {
-	_, err := m.db.ExecContext(ctx, `
-		UPDATE accounts SET quota_limit = ?, quota_usage = ?, quota_checked_at = ? WHERE id = ?`,
-		limit, usage, checkedAt.UTC(), id)
-	return err
-}
-
-type rowScanner interface {
-	Scan(dest ...any) error
-}
-
-func scanAccount(row rowScanner) (Account, error) {
-	var (
-		a          Account
-		quotaLimit sql.NullInt64
-		quotaUsage sql.NullInt64
-		checkedAt  sql.NullTime
-	)
-	if err := row.Scan(&a.ID, &a.Label, &a.TokenPath, &a.AddedAt, &quotaLimit, &quotaUsage, &checkedAt); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return Account{}, ErrNotFound
-		}
 		return Account{}, err
 	}
-	a.QuotaKnown = quotaLimit.Valid
-	a.QuotaLimit = quotaLimit.Int64
-	a.QuotaUsage = quotaUsage.Int64
-	a.QuotaCheckedAt = checkedAt.Time
+	tok, err := m.decryptToken(a.TokenCiphertext)
+	if err != nil {
+		return Account{}, err
+	}
+	a.Token = tok
 	return a, nil
+}
+
+// ListAccounts decrypts every row's token, but a single account's
+// undecryptable token (e.g. after a key rotation with no re-encryption
+// migration) doesn't fail the whole call — its Token is left nil and the
+// caller (Pool.buildAccount) degrades just that one account, matching the
+// same graceful-degradation contract initErr provides for other
+// account-initialization failures.
+func (m *Manifest) ListAccounts(ctx context.Context, userID string) ([]Account, error) {
+	var accounts []Account
+	if err := m.scoped(ctx, userID).Order("label").Find(&accounts).Error; err != nil {
+		return nil, err
+	}
+	for i := range accounts {
+		if tok, err := m.decryptToken(accounts[i].TokenCiphertext); err == nil {
+			accounts[i].Token = tok
+		}
+	}
+	return accounts, nil
+}
+
+// CountActiveChunks reports how many chunks belonging to non-deleted
+// virtual files currently reference accountID. Used to block removing an
+// account that's the only known copy of some file's data.
+//
+// This is the one query in this package that doesn't route through
+// scoped(): the JOIN against virtual_files means an unqualified "user_id"
+// filter would be ambiguous (both tables have the column), so it's
+// qualified explicitly as chunks.user_id instead.
+func (m *Manifest) CountActiveChunks(ctx context.Context, userID, accountID string) (int, error) {
+	var n int64
+	err := m.gdb.WithContext(ctx).
+		Table("chunks").
+		Joins("JOIN virtual_files ON virtual_files.id = chunks.virtual_file_id").
+		Where("chunks.user_id = ? AND chunks.account_id = ? AND virtual_files.status != ?", userID, accountID, StatusDeleted).
+		Count(&n).Error
+	return int(n), err
+}
+
+func (m *Manifest) UpdateAccountQuota(ctx context.Context, userID, id string, limit, usage int64, checkedAt time.Time) error {
+	return m.scoped(ctx, userID).Model(&Account{}).Where("id = ?", id).
+		Updates(map[string]any{
+			"quota_limit":      limit,
+			"quota_usage":      usage,
+			"quota_checked_at": checkedAt.UTC(),
+		}).Error
 }
 
 // --- virtual files ---
 
-type VirtualFile struct {
-	ID          int64
-	Name        string
-	Size        int64
-	ContentHash string
-	ChunkSize   int64
-	FileKey     []byte
-	Replicas    int
-	Version     int
-	Status      string // "complete" | "incomplete" | "deleted"
-	CreatedAt   time.Time
-	ModifiedAt  time.Time
-}
-
-const (
-	StatusComplete   = "complete"
-	StatusIncomplete = "incomplete"
-	StatusDeleted    = "deleted"
-)
-
-func (m *Manifest) CreateVirtualFile(ctx context.Context, vf *VirtualFile) error {
+func (m *Manifest) CreateVirtualFile(ctx context.Context, userID string, vf *VirtualFile) error {
+	vf.UserID = userID
 	now := time.Now().UTC()
 	vf.CreatedAt, vf.ModifiedAt = now, now
 	if vf.Replicas == 0 {
@@ -183,138 +174,66 @@ func (m *Manifest) CreateVirtualFile(ctx context.Context, vf *VirtualFile) error
 		vf.Version = 1
 	}
 
-	res, err := m.db.ExecContext(ctx, `
-		INSERT INTO virtual_files (name, size, content_hash, chunk_size, file_key, replicas, version, status, created_at, modified_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		vf.Name, vf.Size, vf.ContentHash, vf.ChunkSize, vf.FileKey, vf.Replicas, vf.Version, vf.Status, vf.CreatedAt, vf.ModifiedAt)
-	if err != nil {
-		return err
+	err := m.gdb.WithContext(ctx).Create(vf).Error
+	if rhinodb.IsUniqueViolation(err) {
+		return ErrNameExists
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return err
-	}
-	vf.ID = id
-	return nil
-}
-
-func (m *Manifest) SetVirtualFileStatus(ctx context.Context, id int64, status string) error {
-	_, err := m.db.ExecContext(ctx, `
-		UPDATE virtual_files SET status = ?, modified_at = ? WHERE id = ?`,
-		status, time.Now().UTC(), id)
 	return err
 }
 
-func (m *Manifest) GetVirtualFile(ctx context.Context, name string) (VirtualFile, error) {
-	row := m.db.QueryRowContext(ctx, `
-		SELECT id, name, size, content_hash, chunk_size, file_key, replicas, version, status, created_at, modified_at
-		FROM virtual_files WHERE name = ?`, name)
-	return scanVirtualFile(row)
+func (m *Manifest) SetVirtualFileStatus(ctx context.Context, userID string, id int64, status string) error {
+	return m.scoped(ctx, userID).Model(&VirtualFile{}).Where("id = ?", id).
+		Updates(map[string]any{"status": status, "modified_at": time.Now().UTC()}).Error
 }
 
-func (m *Manifest) ListVirtualFiles(ctx context.Context, prefix string) ([]VirtualFile, error) {
-	rows, err := m.db.QueryContext(ctx, `
-		SELECT id, name, size, content_hash, chunk_size, file_key, replicas, version, status, created_at, modified_at
-		FROM virtual_files WHERE name LIKE ? || '%' AND status != ? ORDER BY name`,
-		prefix, StatusDeleted)
-	if err != nil {
-		return nil, err
+func (m *Manifest) GetVirtualFile(ctx context.Context, userID, name string) (VirtualFile, error) {
+	var vf VirtualFile
+	err := m.scoped(ctx, userID).Where("name = ?", name).First(&vf).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return VirtualFile{}, ErrNotFound
 	}
-	defer rows.Close()
+	return vf, err
+}
 
+func (m *Manifest) ListVirtualFiles(ctx context.Context, userID, prefix string) ([]VirtualFile, error) {
 	var out []VirtualFile
-	for rows.Next() {
-		vf, err := scanVirtualFile(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, vf)
-	}
-	return out, rows.Err()
+	err := m.scoped(ctx, userID).
+		Where("name LIKE ? AND status != ?", prefix+"%", StatusDeleted).
+		Order("name").
+		Find(&out).Error
+	return out, err
 }
 
-func (m *Manifest) DeleteVirtualFile(ctx context.Context, name string, purge bool) error {
+// DeleteVirtualFile soft-deletes (status=deleted) unless purge is set, in
+// which case the row is removed outright — chunks cascade-delete with it
+// (ON DELETE CASCADE). purge intentionally doesn't check RowsAffected: the
+// caller (Pool.Remove) already confirmed the file exists via GetVirtualFile
+// before calling this.
+func (m *Manifest) DeleteVirtualFile(ctx context.Context, userID, name string, purge bool) error {
 	if purge {
-		_, err := m.db.ExecContext(ctx, `DELETE FROM virtual_files WHERE name = ?`, name)
-		return err
+		return m.scoped(ctx, userID).Where("name = ?", name).Delete(&VirtualFile{}).Error
 	}
-	res, err := m.db.ExecContext(ctx, `
-		UPDATE virtual_files SET status = ?, modified_at = ? WHERE name = ?`,
-		StatusDeleted, time.Now().UTC(), name)
-	if err != nil {
-		return err
+	res := m.scoped(ctx, userID).Model(&VirtualFile{}).Where("name = ?", name).
+		Updates(map[string]any{"status": StatusDeleted, "modified_at": time.Now().UTC()})
+	if res.Error != nil {
+		return res.Error
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
+	if res.RowsAffected == 0 {
 		return ErrNotFound
 	}
 	return nil
 }
 
-func scanVirtualFile(row rowScanner) (VirtualFile, error) {
-	var vf VirtualFile
-	if err := row.Scan(&vf.ID, &vf.Name, &vf.Size, &vf.ContentHash, &vf.ChunkSize, &vf.FileKey,
-		&vf.Replicas, &vf.Version, &vf.Status, &vf.CreatedAt, &vf.ModifiedAt); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return VirtualFile{}, ErrNotFound
-		}
-		return VirtualFile{}, err
-	}
-	return vf, nil
-}
-
 // --- chunks ---
 
-type Chunk struct {
-	ID              int64
-	VirtualFileID   int64
-	Index           int
-	AccountID       string
-	RemoteFileID    string
-	RemoteFolderID  string
-	PlaintextSize   int64
-	PlaintextSHA256 string
-	CiphertextMD5   string
-	UploadedAt      time.Time
-}
-
-func (m *Manifest) AddChunk(ctx context.Context, c *Chunk) error {
+func (m *Manifest) AddChunk(ctx context.Context, userID string, c *Chunk) error {
+	c.UserID = userID
 	c.UploadedAt = time.Now().UTC()
-	res, err := m.db.ExecContext(ctx, `
-		INSERT INTO chunks (virtual_file_id, idx, account_id, remote_file_id, remote_folder_id, plaintext_size, plaintext_sha256, ciphertext_md5, uploaded_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		c.VirtualFileID, c.Index, c.AccountID, c.RemoteFileID, c.RemoteFolderID, c.PlaintextSize, c.PlaintextSHA256, c.CiphertextMD5, c.UploadedAt)
-	if err != nil {
-		return err
-	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return err
-	}
-	c.ID = id
-	return nil
+	return m.gdb.WithContext(ctx).Create(c).Error
 }
 
-func (m *Manifest) ListChunks(ctx context.Context, virtualFileID int64) ([]Chunk, error) {
-	rows, err := m.db.QueryContext(ctx, `
-		SELECT id, virtual_file_id, idx, account_id, remote_file_id, remote_folder_id, plaintext_size, plaintext_sha256, ciphertext_md5, uploaded_at
-		FROM chunks WHERE virtual_file_id = ? ORDER BY idx`, virtualFileID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
+func (m *Manifest) ListChunks(ctx context.Context, userID string, virtualFileID int64) ([]Chunk, error) {
 	var out []Chunk
-	for rows.Next() {
-		var c Chunk
-		if err := rows.Scan(&c.ID, &c.VirtualFileID, &c.Index, &c.AccountID, &c.RemoteFileID, &c.RemoteFolderID,
-			&c.PlaintextSize, &c.PlaintextSHA256, &c.CiphertextMD5, &c.UploadedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, c)
-	}
-	return out, rows.Err()
+	err := m.scoped(ctx, userID).Where("virtual_file_id = ?", virtualFileID).Order("idx").Find(&out).Error
+	return out, err
 }

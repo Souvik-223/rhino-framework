@@ -7,7 +7,7 @@
 **RIHNO Framework** — two Go subsystems sharing one storage/encryption layer:
 
 1. A peer-to-peer, content-addressable distributed file store (`server.go`, `p2p/`). Nodes connect over raw TCP, store file content on disk using a SHA-1 content-addressable path layout, and AES-256-CTR-encrypt file bytes before they hit disk or the network. A node without a file locally can request it from peers and stream it back. No database, no HTTP/REST API, no web frontend — produces a single binary (`bin/fs`).
-2. A Google-Drive-pooled storage CLI (`drivepool/`, `cmd/rhino`). Pools N free Google Drive accounts (15GB each) into one virtual volume: `rhino put` encrypts a file and uploads it to whichever registered account currently has the most free space; `rhino get` reverses that. Tracked in a local SQLite manifest. Produces a second binary (`bin/rhino`). **Not yet implemented**: splitting one file's bytes across multiple accounts — today each file is one upload to one account (see "Working guidelines" below).
+2. A Google-Drive-pooled storage CLI + web portal (`drivepool/`, `cmd/rhino`, `backend/`, `frontend/`). Pools N free Google Drive accounts (15GB each) into one virtual volume: `rhino put` encrypts a file and uploads it to whichever registered account currently has the most free space; `rhino get` reverses that. Both the CLI and the multi-tenant web portal (`rhino serve`) share one Postgres database (`DATABASE_URL`), queried via GORM — every account/file/chunk row is scoped by a `user_id` column (see `gudeMD/er_diagram.md`). Produces a second binary (`bin/rhino`).
 
 See [README.md](README.md) for a full walkthrough of how the pieces fit together, the file structure, and how to run it.
 
@@ -20,7 +20,8 @@ See [README.md](README.md) for a full walkthrough of how the pieces fit together
 - **Streaming vs. discrete messages**: raw file bytes are never gob-encoded. A one-byte marker (`p2p.IncomingMessage` / `p2p.IncomingStream` in `p2p/message.go`) tells the TCP read loop whether to decode the next bytes as an `RPC` or treat them as a stream to hand off directly (see `TCPTransport.handleConn` and the `sync.WaitGroup`-based `peer.CloseStream()`/`wg.Wait()` handshake).
 - **Content addressing**: `storage.CASPathTransformFunc` (`storage/store.go`) — SHA-1 hash of the key, hex-encoded, split into 5-character directory segments. Don't bypass this with flat filenames when adding storage paths; use `PathTransformFunc` consistently. `drivepool` uses a SHA-256 content hash (not SHA-1) to name each file's remote Drive folder, since that hash also doubles as the integrity-check/future-dedup key — a stronger hash is warranted there.
 - **Encryption**: `storage.CopyEncrypt`/`storage.CopyDecrypt` (`storage/crypto.go`) — AES-256-CTR, random IV per call, IV prepended to ciphertext. `storage.HashKey` (MD5) is only for obfuscating storage keys on the wire, not a security boundary — don't repurpose it for anything security-sensitive. Both `server.go` (P2P) and `drivepool/pool.go` (Drive pooling) share this same pipeline via the `storage` package rather than each having their own copy.
-- **Concurrency**: peer map guarded by `sync.Mutex` (`FileServer.peerLock`); per-peer stream synchronization via `sync.WaitGroup`; RPCs delivered over a buffered channel (`Transport.Consume() <-chan RPC`). Keep new concurrent state behind an explicit mutex or channel rather than ad hoc synchronization. `drivepool.Manifest` opens SQLite with `SetMaxOpenConns(1)` since `modernc.org/sqlite` isn't safe for concurrent writers on one `*sql.DB` — don't raise that without adding real locking.
+- **Concurrency**: peer map guarded by `sync.Mutex` (`FileServer.peerLock`); per-peer stream synchronization via `sync.WaitGroup`; RPCs delivered over a buffered channel (`Transport.Consume() <-chan RPC`). Keep new concurrent state behind an explicit mutex or channel rather than ad hoc synchronization. `drivepool.Manifest` wraps a shared `*gorm.DB` (see `db.Open`) — Postgres handles concurrent access natively, no `SetMaxOpenConns(1)`-style single-writer restriction like the old SQLite backend needed.
+- **Database**: one shared Postgres database (`DATABASE_URL`, e.g. Neon) for both the CLI and the web portal — no ORM-free/SQLite era left. Queries go through [GORM](https://gorm.io); schema changes are plain SQL files under `db/migrations/`, applied via [golang-migrate](https://github.com/golang-migrate/migrate) (`db.Migrate`, run at startup by both `rhino serve` and every CLI command) — **not** GORM's `AutoMigrate`, since the tenant-isolation constraints need to be reviewable in a SQL diff, not re-inferred from struct tags. Every per-user table (`accounts`, `virtual_files`, `chunks`, `chunk_replicas`) carries a `user_id` column; `drivepool/manifest/manifest.go`'s private `scoped(ctx, userID)` helper is the only sanctioned way any query is built — it panics on an empty `userID` rather than silently matching zero rows. See `gudeMD/er_diagram.md` for the full schema and rationale.
 - **Resource cleanup**: every `*os.File` opened for writing must be `defer f.Close()`'d — `storage.Store`'s `writeStream`/`WriteDecrypt` previously leaked write handles (harmless on Linux/Mac, but broke `Store.Delete`/`Clear` on Windows since it can't remove a file with an open handle); this has been fixed, so don't reintroduce the pattern.
 - **Graceful degradation over hard failure**: a `drivepool.Account` whose token fails to load/refresh is kept in `Pool.accounts` with `initErr` set rather than aborting `Open`/`AddAccount` — placement (`pickAccount`) and `ListAccountStatus` skip/report it instead of crashing the whole operation. Follow this same pattern for new failure modes in `drivepool` (never let one bad account take down an operation involving healthy ones).
 
@@ -51,39 +52,72 @@ p2p/
 
 drivepool/              Google Drive multi-account pooling — core domain logic.
 ├── pool.go               Pool / Account — AddAccount/ListAccountStatus/RemoveAccount,
-│                         Put (encrypt+stage+upload) / Get (download+decrypt+verify), List, Remove.
-├── placement.go          pickAccount — least-used-first placement across healthy accounts.
-├── pool_test.go          Tests against a fake in-memory RemoteStore (no real Drive/network calls).
+│                         Put/PutStream (chunked encrypt+upload, spread across accounts) /
+│                         Get/GetStream (download+decrypt+verify), List, Remove. Pool is scoped
+│                         to one userID for its whole lifetime, set once at construction (Open) —
+│                         every internal manifest call passes it automatically.
+├── placement.go          pickAccount / placementTracker — most-free-space-first placement,
+│                         live-queried per file (single chunk) or once then tracked in-memory
+│                         (multi-chunk, to avoid a placement race across concurrent uploads).
+├── bootstrap.go          DefaultClientSecretPath, OpenWithUser — wires OAuth client config +
+│                         an already-open manifest.Manifest into a Pool for a given userID.
+├── pool_test.go, account_test.go, chunking_test.go, fileinfo_test.go
+│                         Tests against a fake in-memory RemoteStore (no real Drive/network
+│                         calls) and a real Postgres transaction (db/dbtest) — no SQLite fallback.
 ├── auth/
-│   ├── consent.go          RunConsentFlow — OAuth2 loopback-redirect consent flow (OOB is deprecated).
-│   └── tokenstore.go        TokenStore — per-account token persistence (0600 files).
+│   └── consent.go          RunConsentFlow — OAuth2 loopback-redirect consent flow (OOB is deprecated).
 ├── gdrive/
 │   └── client.go            RemoteStore interface + Client — Drive API v3 wrapper.
 └── manifest/
-    ├── schema.go             SQLite DDL: accounts, virtual_files, chunks, chunk_replicas.
-    └── manifest.go           Manifest — typed queries/inserts over database/sql (modernc.org/sqlite).
+    ├── models.go             GORM model structs: Account, VirtualFile, Chunk, ChunkReplica.
+    ├── manifest.go           Manifest — GORM queries, all scoped by userID (see scoped()); also
+    │                         handles OAuth token encryption at rest (RHINO_TOKEN_ENCRYPTION_KEY).
+    └── manifest_test.go      Tenant isolation, cascade/set-null FK behavior, token round-trip.
+
+db/                     Shared Postgres connection/migration package — used by both cmd/rhino
+                        and backend/, neither opens its own connection.
+├── db.go                  Open (pooled *gorm.DB, tuned for Neon), IsUniqueViolation,
+│                         DatabaseURLFromEnv/TokenEncryptionKeyFromEnv (both support a
+│                         Docker-secrets-style _FILE variant).
+├── migrate.go             Migrate — applies db/migrations/*.sql via golang-migrate, idempotent,
+│                         embedded into the binary, run at startup by every entrypoint.
+├── migrations/             Numbered plain-SQL migration files — not GORM AutoMigrate; see
+│                         gudeMD/er_diagram.md for why.
+└── dbtest/                 Test-only: OpenTx wraps each test in a rolled-back transaction.
 
 cmd/rhino/
-└── main.go               cobra CLI: account add/list/remove, put, get, ls, rm, status.
+├── main.go               cobra CLI: account add/list/remove, put, get, ls, rm, status.
+│                         Every command requires --user/RHINO_USER (authdb.GetOrCreateCLIUser) —
+│                         no default identity, no local-file fallback for its data anymore.
+└── serve.go               `rhino serve` — runs the multi-tenant web portal (backend/).
                           Builds bin/rhino, separate from the P2P side's bin/fs.
 
+backend/                Web portal: Gin HTTP API + session auth + embedded frontend build.
+├── server.go / config.go / handlers*.go / middleware.go / poolcache.go / assets.go
+└── authdb/                users(id, username, password_hash, created_at) — GORM, same shared
+                          Postgres database as drivepool/manifest (see db/).
+
+frontend/               Vue 3 + Vite SPA — see gudeMD/web_portal.md §3.
+
 bin/fs                  Build output of `make build` — currently checked into git (no .gitignore).
-Makefile                build / run / test / build-rhino / run-rhino targets.
-go.mod / go.sum          Module + dependencies. Google API/OAuth/SQLite/cobra libs added for drivepool;
-                        testify et al. remain test-only, marked indirect.
+Makefile                build / run / test / build-rhino / run-rhino / build-portal / run-portal targets.
+go.mod / go.sum          Module + dependencies. GORM + Postgres driver + golang-migrate replaced
+                        modernc.org/sqlite entirely (fully removed, not just unused).
 ```
 
 ## Commands
 
 ```bash
-make build        # go build -o bin/fs
-make run          # build, then run ./bin/fs (listens on TCP :3000)
-make build-rhino  # go build -o bin/rhino ./cmd/rhino
-make run-rhino    # build, then run ./bin/rhino
-make test         # go test ./... -v
+make build         # go build -o bin/fs
+make run           # build, then run ./bin/fs (listens on TCP :3000)
+make build-rhino   # go build -o bin/rhino ./cmd/rhino
+make run-rhino     # build, then run ./bin/rhino
+make build-portal  # build the frontend, copy into backend/dist, then go build -o bin/rhino
+make run-portal    # build-portal, then run ./bin/rhino serve
+make test          # go test ./... -v — needs DATABASE_URL set to a real Postgres, see below
 ```
 
-There's no linter configured — at minimum run `go vet ./...` and `gofmt -l .` after non-trivial changes (note: `gofmt -l .` will flag most pre-existing files as needing formatting purely due to CRLF line endings on this Windows checkout, not real style issues — check `gofmt -d <file>` before "fixing" one of those). No CI config and no `.env`/config file exist for the P2P side. The Drive pool's local state (SQLite manifest + OAuth tokens + client secret) lives under the OS config dir (`%APPDATA%\rhino` on Windows), not in the repo. A `.gitignore` exists and excludes `CLAUDE.md`, `AGENTS.md`, `.claude/`, `.agent/`, and `/tasks` — these are personal/local files, not part of the shared repo.
+There's no linter configured — at minimum run `go vet ./...` and `gofmt -l .` after non-trivial changes (note: `gofmt -l .` will flag most pre-existing files as needing formatting purely due to CRLF line endings on this Windows checkout, not real style issues — check `gofmt -d <file>` before "fixing" one of those). CI (`.github/workflows/ci.yml`) runs a `postgres:16-alpine` service container for the `go` job; locally, `go test ./...` needs `DATABASE_URL` pointing at a real Postgres or every `drivepool`/`backend` test `t.Skip`s (Podman/Docker works fine — see `gudeMD/testing.md` §1 for the exact commands). `RHINO_TOKEN_ENCRYPTION_KEY` (32 bytes hex) is also required by any code path that opens a `manifest.Manifest` — CLI and backend alike. `client_secret.json` (the Google OAuth app credential) is the one piece of state still resolved to a local file by default (`%APPDATA%\rhino\client_secret.json` on Windows) — everything else (accounts, files, chunks, users) lives in Postgres now. A `.gitignore` exists and excludes `CLAUDE.md`, `AGENTS.md`, `.claude/`, `.agent/`, and `/tasks` — these are personal/local files, not part of the shared repo.
 
 ## Working guidelines
 
@@ -91,8 +125,8 @@ There's no linter configured — at minimum run `go vet ./...` and `gofmt -l .` 
 - New transport implementations belong in `p2p/` and must satisfy `p2p.Transport`/`p2p.Peer`; don't add transport-specific branching into `server.go`.
 - New gob-serialized message payload types must be registered in the `init()` in `server.go` or decoding will fail at runtime with no compile-time warning.
 - `main.go` is a bare transport smoke-test today, not the wired-up file server — if you extend it into a real CLI, wire an actual `FileServer` (per the example in [README.md](README.md#running-multiple-nodes-manual-wiring)) rather than hand-rolling networking logic directly in `main.go`.
-- **`drivepool` does not yet split one file across multiple accounts** — `Pool.Put` uploads the whole encrypted file as a single chunk (`chunks.idx = 0`) to whichever one account has the most free space. The `chunks`/`chunk_replicas` schema already supports multiple chunks/replicas per virtual file; implementing the actual split (chunk boundaries, per-chunk placement, parallel upload/download, reassembly by offset) is tracked as Phase 3 in `tasks/modification_plan.md` — don't assume it exists when reasoning about capacity (a file is still capped by one account's free space today) or when asked to add features that depend on it (e.g. replication, resumable partial uploads).
-- Test `drivepool` core logic (placement, Put/Get) against the fake `gdrive.RemoteStore` in `drivepool/pool_test.go`, not real Drive calls — there are no live Google credentials in this environment, and the fake already exercises the full encrypt→stage→upload→download→decrypt→verify path.
+- **`drivepool` splits large files across multiple accounts** (`Pool.PutStream`, `drivepool/placement.go`'s `placementTracker`) — a file bigger than one `ChunkSize` gets multiple `chunks` rows spread across whichever accounts have room, uploaded/downloaded concurrently. What's still schema-only/unimplemented is **replication** — `chunk_replicas` and `virtual_files.replicas` exist in the schema but nothing writes to them; each chunk still has exactly one copy, so one account going down still fails that chunk's file. Tracked as Phase 3 in `tasks/modification_plan.md` — don't assume replication exists when reasoning about durability, or when asked to add features that depend on it.
+- Test `drivepool` core logic (placement, Put/Get, tenant isolation) against the fake `gdrive.RemoteStore` in `drivepool/pool_test.go` et al., not real Drive calls — there are no live Google credentials in this environment, and the fake already exercises the full encrypt→stage→upload→download→decrypt→verify path. These tests do hit a real Postgres (via `db/dbtest`'s transaction-per-test helper, rolled back automatically) — set `DATABASE_URL` before running them, see the Commands section above.
 - The OAuth consent screen must be published to **"In production"**, not left in "Testing" — Testing-status refresh tokens expire after 7 days (verified against current Google docs), which `drivepool` does not currently work around with a re-auth prompt.
 - Run `make test` (`go test ./... -v`) after non-trivial changes, plus `go vet ./...`. `go build ./...` covers `cmd/rhino` too.
 - Never commit unless explicitly asked.

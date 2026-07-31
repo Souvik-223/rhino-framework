@@ -51,9 +51,9 @@ export const useFilesStore = defineStore('files', () => {
     uploads.value = uploads.value.filter((u) => u.id !== id)
   }
 
-  async function remove(name: string, purge: boolean) {
-    await api.deleteFile(name, purge)
-    toast.success(purge ? `Deleted "${name}" permanently` : `Removed "${name}"`)
+  async function remove(name: string) {
+    await api.deleteFile(name, true)
+    toast.success(`Deleted "${name}"`)
     await refresh()
   }
 

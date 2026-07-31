@@ -1,5 +1,3 @@
-// Mirrors cmd/rhino/main.go's humanBytes so the portal and the CLI report
-// sizes the same way.
 export function formatBytes(n: number): string {
   const unit = 1024
   if (n < unit) return `${n} B`
@@ -12,8 +10,6 @@ export function formatBytes(n: number): string {
   return `${(n / div).toFixed(1)} ${'KMGTPE'[exp]}iB`
 }
 
-// Usage-bar color threshold shared by Sidebar.vue: green <70%, amber <90%,
-// red >=90% — matches plans/web_portal.md's UI layout spec.
 export function usageLevel(usedFraction: number): 'ok' | 'warn' | 'danger' {
   if (usedFraction >= 0.9) return 'danger'
   if (usedFraction >= 0.7) return 'warn'

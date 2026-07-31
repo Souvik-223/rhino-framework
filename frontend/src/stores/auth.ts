@@ -4,7 +4,7 @@ import { api, ApiError } from '../api/client'
 
 export const useAuthStore = defineStore('auth', () => {
   const username = ref<string | null>(null)
-  const checked = ref(false) // true once an initial /me check has completed
+  const checked = ref(false)
 
   async function checkSession() {
     try {

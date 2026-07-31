@@ -2,17 +2,22 @@ services:
   rhino:
     build: .
     environment:
-      - RHINO_DATA_DIR=/data
       - RHINO_ADDR=:8080
       - RHINO_SESSION_SECRET_FILE=/run/secrets/session_secret
+      - DATABASE_URL_FILE=/run/secrets/database_url
+      - RHINO_TOKEN_ENCRYPTION_KEY_FILE=/run/secrets/token_encryption_key
+      - RHINO_CLIENT_SECRET=/config/client_secret.json
     volumes:
-      - rhino-data:/data
       # client_secret.json is the Google OAuth app credential, shared by
       # every user of this deployment — bind-mounted read-only rather than
-      # baked into the image or committed to the repo.
-      - ./secrets/client_secret.json:/data/client_secret.json:ro
+      # baked into the image or committed to the repo. There's no longer a
+      # local data volume: every user's accounts/files/chunks live in the
+      # Postgres database at DATABASE_URL (e.g. Neon), not on this host.
+      - ./secrets/client_secret.json:/config/client_secret.json:ro
     secrets:
       - session_secret
+      - database_url
+      - token_encryption_key
     ports:
       - "127.0.0.1:8080:8080" # Caddy is the only thing that should be reachable externally
 
@@ -28,9 +33,18 @@ services:
       - rhino
 
 volumes:
-  rhino-data:
   caddy-data:
 
 secrets:
   session_secret:
     file: ./secrets/session_secret.txt
+  # Postgres connection string (e.g. a Neon DSN, including its password) —
+  # never put this directly in the environment: block above, see
+  # DATABASE_URL_FILE's doc comment in backend/config.go for why.
+  database_url:
+    file: ./secrets/database_url.txt
+  # 32 bytes, hex-encoded — generate with `openssl rand -hex 32`. Encrypts
+  # every stored OAuth token; losing this key means every connected Drive
+  # account needs to be reconnected from scratch.
+  token_encryption_key:
+    file: ./secrets/token_encryption_key.txt
