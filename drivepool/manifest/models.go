@@ -58,16 +58,24 @@ const (
 // of being deleted or left pointing at a nonexistent row — see
 // Pool.ListWithAccounts for how that's surfaced as "disconnected".
 type Chunk struct {
-	ID              int64     `gorm:"primaryKey"`
-	UserID          string    `gorm:"not null;column:user_id"`
-	VirtualFileID   int64     `gorm:"not null;column:virtual_file_id;uniqueIndex:idx_chunks_vf_idx"`
-	Index           int       `gorm:"not null;column:idx;uniqueIndex:idx_chunks_vf_idx"`
-	AccountID       *string   `gorm:"column:account_id"`
-	RemoteFileID    string    `gorm:"not null;column:remote_file_id"`
-	RemoteFolderID  string    `gorm:"not null;column:remote_folder_id"`
-	PlaintextSize   int64     `gorm:"not null;column:plaintext_size"`
-	PlaintextSHA256 string    `gorm:"not null;column:plaintext_sha256"`
-	CiphertextMD5   string    `gorm:"not null;column:ciphertext_md5"`
+	ID              int64   `gorm:"primaryKey"`
+	UserID          string  `gorm:"not null;column:user_id"`
+	VirtualFileID   int64   `gorm:"not null;column:virtual_file_id;uniqueIndex:idx_chunks_vf_idx"`
+	Index           int     `gorm:"not null;column:idx;uniqueIndex:idx_chunks_vf_idx"`
+	AccountID       *string `gorm:"column:account_id"`
+	RemoteFileID    string  `gorm:"not null;column:remote_file_id"`
+	RemoteFolderID  string  `gorm:"not null;column:remote_folder_id"`
+	PlaintextSize   int64   `gorm:"not null;column:plaintext_size"`
+	PlaintextSHA256 string  `gorm:"not null;column:plaintext_sha256"`
+	CiphertextMD5   string  `gorm:"not null;column:ciphertext_md5"`
+	// CompressionAlgo is "none" or "flate" — the chunk's plaintext is
+	// compressed before encryption only when doing so actually shrinks it
+	// (see drivepool.Pool.uploadChunk). The GORM default tag makes a zero
+	// value ("") omitted from INSERTs so the column's SQL DEFAULT 'none'
+	// applies instead — existing callers that construct a Chunk without
+	// setting this field still insert correctly.
+	CompressionAlgo string    `gorm:"not null;column:compression_algo;default:none"`
+	CompressedSize  int64     `gorm:"not null;column:compressed_size"`
 	UploadedAt      time.Time `gorm:"not null;column:uploaded_at"`
 }
 

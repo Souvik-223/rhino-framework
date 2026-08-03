@@ -80,10 +80,11 @@ go test ./storage/... ./p2p/... -v  # just the P2P side
 
 | Package | What it actually covers |
 | --- | --- |
-| `storage` | CAS path-sharding (`store_test.go`), write/read/has/delete round trip, AES-256-CTR encrypt→decrypt round trip (`crypto_test.go`) |
+| `storage` | CAS path-sharding (`store_test.go`), write/read/has/delete round trip, AES-256-CTR encrypt→decrypt round trip (`crypto_test.go`), DEFLATE compress→decompress round trip for compressible/incompressible/empty input (`compress_test.go`) |
 | `p2p` | `TCPTransport` dial/accept smoke test |
 | `drivepool` (`pool_test.go`) | Placement (`pickAccount` picks the most-free healthy account, skips unhealthy ones, errors when none are healthy), full `Put`/`Get` round trip against a fake in-memory Drive account, account-removal guard (`ErrAccountInUse`/`force`), and `TestPoolsAreTenantIsolated` — two `Pool`s scoped to different users never see each other's accounts/files |
 | `drivepool` (`chunking_test.go`) | A file larger than `ChunkSize` actually splits into multiple chunks; those chunks land on **different** accounts (not all on one); a mid-upload chunk failure triggers best-effort cleanup of the chunks that *did* upload, and leaves no manifest record; a chunk whose stored ciphertext is tampered with post-upload is detected and `GetStream` fails rather than silently returning corrupted data |
+| `drivepool` (`compression_test.go`) | Highly compressible chunk data is actually stored compressed (`CompressionAlgo == "flate"`, `CompressedSize < PlaintextSize`) and round-trips correctly; random/incompressible data is stored uncompressed (`CompressionAlgo == "none"`) and still round-trips; a chunk row with `CompressionAlgo` left at its Go zero value (simulating data from before this feature existed) is read back unmodified, with no decompression attempted — see `compression.md` |
 | `drivepool/manifest` (`manifest_test.go`) | Token encrypt/decrypt round trip, tenant isolation and per-user `UNIQUE(user_id, name/label)` on accounts and virtual files, `ON DELETE CASCADE` (chunks with their virtual file) and `ON DELETE SET NULL` (chunks when their account is removed), `CountActiveChunks` excluding soft-deleted files |
 | `backend/tests` | Register → `/me` → logout → `/me` now 401; duplicate-username registration is rejected (409); wrong password is rejected (401); `/api/accounts`/`/api/files` require a session (401 without one); full upload → list → download → delete round trip over real HTTP via the real Gin router; `/healthz`/`/readyz` |
 
@@ -431,6 +432,7 @@ version and `latest`.
 | Concurrent chunk upload/download | Implicit in the above — inspect timing/logs, or read `drivepool/pool.go`'s `PutStream`/`GetStream` |
 | Partial-upload-failure cleanup | `go test ./drivepool/...` (`TestPutStreamFailureCleansUpUploadedChunks`) — hard to trigger manually on purpose |
 | Tampered-chunk detection | `go test ./drivepool/...` (`TestGetStreamDetectsTamperedChunk`) |
+| Per-chunk compression (compress-if-smaller, transparent decompression) | `go test ./storage/... ./drivepool/...` (`compress_test.go`, `compression_test.go`) — see `compression.md` |
 | Graceful degradation (one bad account doesn't break others) | Revoke one account's token/consent in your Google account settings, then confirm other commands still work and only that account reports "unavailable" |
 | Portal registration/login/logout/session enforcement | §6.3 or §6.5, or `go test ./backend/...` |
 | Multi-tenant isolation (web portal, session-based) | §6.4 |

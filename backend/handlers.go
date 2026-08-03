@@ -152,9 +152,18 @@ func (s *Server) handleDownloadFile(c *gin.Context) {
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", name))
 	c.Header("Content-Type", "application/octet-stream")
 	if err := pool.GetStream(c.Request.Context(), name, c.Writer); err != nil {
-		// The response may already be partially written by the time a
-		// chunk fails partway through a stream — there's no clean way to
-		// retract bytes already sent to the client at this point.
+		// GetStream checks the file exists before writing any bytes, so a
+		// not-found error means nothing's been sent yet — safe to clear the
+		// headers set above and return a normal JSON error instead of an
+		// empty octet-stream response.
+		if errors.Is(err, manifest.ErrNotFound) {
+			c.Header("Content-Disposition", "")
+			c.Header("Content-Type", "")
+			c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
+			return
+		}
+		// Any other failure can happen mid-stream, after bytes are already
+		// written — there's no clean way to retract those at this point.
 		c.AbortWithError(http.StatusInternalServerError, err) //nolint:errcheck
 	}
 }

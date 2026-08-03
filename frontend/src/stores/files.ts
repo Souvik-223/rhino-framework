@@ -52,9 +52,14 @@ export const useFilesStore = defineStore('files', () => {
   }
 
   async function remove(name: string) {
-    await api.deleteFile(name, true)
-    toast.success(`Deleted "${name}"`)
-    await refresh()
+    try {
+      await api.deleteFile(name, true)
+      toast.success(`Deleted "${name}"`)
+      await refresh()
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'delete failed'
+      toast.error(`Failed to delete "${name}"`, { description: message })
+    }
   }
 
   return { files, loading, search, uploads, refresh, upload, uploadMany, dismissUpload, remove }

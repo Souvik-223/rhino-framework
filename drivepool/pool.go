@@ -124,7 +124,16 @@ func (p *Pool) buildAccount(ctx context.Context, row manifest.Account) *Account 
 		return a
 	}
 
-	ts := p.clientCfg.TokenSource(ctx, row.Token)
+	// context.Background(), not ctx: this TokenSource is stored on Account
+	// and reused for the account's whole time in the (cross-request)
+	// poolCache — golang.org/x/oauth2 captures whatever context it's given
+	// here and reuses it for every future token refresh. ctx here is a
+	// single HTTP request's context, canceled the moment that request
+	// returns, so every later refresh (often well after the request that
+	// built this Pool has finished) would fail with "context canceled"
+	// otherwise, even though nothing is actually wrong with the request
+	// that's using the account at that point.
+	ts := p.clientCfg.TokenSource(context.Background(), row.Token)
 	store, err := p.newClient(ctx, ts)
 	if err != nil {
 		a.initErr = fmt.Errorf("init client: %w", err)
@@ -224,7 +233,12 @@ func (p *Pool) finishAddAccount(ctx context.Context, label string, tok *oauth2.T
 		return nil, fmt.Errorf("drivepool: Google didn't return a refresh token for %q — the account would work for about an hour and then fail permanently. Try again; if it keeps happening, revoke this app's access at myaccount.google.com/permissions and reconnect", label)
 	}
 
-	ts := p.clientCfg.TokenSource(ctx, tok)
+	// context.Background(), not ctx — same reasoning as buildAccount: this
+	// TokenSource is stored on the new Account and reused for every future
+	// token refresh for as long as this Pool stays in poolCache, well
+	// beyond the lifetime of the request that's connecting the account
+	// right now.
+	ts := p.clientCfg.TokenSource(context.Background(), tok)
 	store, err := p.newClient(ctx, ts)
 	if err != nil {
 		return nil, fmt.Errorf("drivepool: init client: %w", err)
@@ -357,6 +371,8 @@ type uploadedChunk struct {
 	plaintextSize   int64
 	plaintextSHA256 string
 	ciphertextMD5   string
+	compressionAlgo string
+	compressedSize  int64
 }
 
 // folderResolver ensures EnsureFolder is called at most once per account
@@ -520,6 +536,8 @@ func (p *Pool) PutStream(ctx context.Context, r io.Reader, size int64, virtualNa
 			PlaintextSize:   uc.plaintextSize,
 			PlaintextSHA256: uc.plaintextSHA256,
 			CiphertextMD5:   uc.ciphertextMD5,
+			CompressionAlgo: uc.compressionAlgo,
+			CompressedSize:  uc.compressedSize,
 		}); err != nil {
 			return fmt.Errorf("drivepool: record chunk %d: %w", uc.index, err)
 		}
@@ -534,9 +552,14 @@ func (p *Pool) PutStream(ctx context.Context, r io.Reader, size int64, virtualNa
 // Drive's resumable upload (so a failed chunk can be re-read and retried),
 // so this needs zero changes to the RemoteStore interface.
 func (p *Pool) uploadChunk(ctx context.Context, acc *Account, folders *folderResolver, fileID string, fileKey []byte, idx int, plaintext []byte) (*uploadedChunk, error) {
+	payload, algo := plaintext, storage.CompressionNone
+	if compressed, err := storage.CompressBytes(plaintext); err == nil && len(compressed) < len(plaintext) {
+		payload, algo = compressed, storage.CompressionFlate
+	}
+
 	var ciphertext bytes.Buffer
 	md := md5.New()
-	if _, err := storage.CopyEncrypt(fileKey, bytes.NewReader(plaintext), io.MultiWriter(&ciphertext, md)); err != nil {
+	if _, err := storage.CopyEncrypt(fileKey, bytes.NewReader(payload), io.MultiWriter(&ciphertext, md)); err != nil {
 		return nil, fmt.Errorf("drivepool: encrypt chunk %d: %w", idx, err)
 	}
 	plaintextSum := sha256.Sum256(plaintext)
@@ -565,6 +588,8 @@ func (p *Pool) uploadChunk(ctx context.Context, acc *Account, folders *folderRes
 		plaintextSize:   int64(len(plaintext)),
 		plaintextSHA256: plaintextHash,
 		ciphertextMD5:   ciphertextMD5,
+		compressionAlgo: algo,
+		compressedSize:  int64(len(payload)),
 	}, nil
 }
 
@@ -697,16 +722,25 @@ func (p *Pool) downloadChunk(ctx context.Context, fileKey []byte, chunk manifest
 	}
 	defer rc.Close()
 
-	var plaintext bytes.Buffer
-	if _, err := storage.CopyDecrypt(fileKey, rc, &plaintext); err != nil {
+	var decrypted bytes.Buffer
+	if _, err := storage.CopyDecrypt(fileKey, rc, &decrypted); err != nil {
 		return nil, fmt.Errorf("drivepool: decrypt chunk %d: %w", chunk.Index, err)
 	}
 
-	sum := sha256.Sum256(plaintext.Bytes())
+	plaintext := decrypted.Bytes()
+	if chunk.CompressionAlgo == storage.CompressionFlate {
+		out, err := storage.DecompressBytes(plaintext)
+		if err != nil {
+			return nil, fmt.Errorf("drivepool: decompress chunk %d: %w", chunk.Index, err)
+		}
+		plaintext = out
+	}
+
+	sum := sha256.Sum256(plaintext)
 	if got := hex.EncodeToString(sum[:]); got != chunk.PlaintextSHA256 {
 		return nil, fmt.Errorf("drivepool: chunk %d hash mismatch: got %s want %s", chunk.Index, got, chunk.PlaintextSHA256)
 	}
-	return plaintext.Bytes(), nil
+	return plaintext, nil
 }
 
 func (p *Pool) List(ctx context.Context, prefix string) ([]manifest.VirtualFile, error) {
@@ -783,14 +817,39 @@ func (p *Pool) Remove(ctx context.Context, virtualName string, purge bool) error
 		if err != nil {
 			return err
 		}
+
+		// folders collects each healthy account's per-file folder
+		// (accountID -> folderID), deduplicated — every chunk an account
+		// holds for this file lives in the one folder uploadChunk created
+		// for it (see folderResolver), so it only needs deleting once,
+		// after all of that account's chunks are gone.
+		folders := make(map[string]string)
 		for _, chunk := range chunks {
 			if chunk.AccountID == nil {
 				continue
 			}
-			if a, ok := p.accounts[*chunk.AccountID]; ok && a.initErr == nil {
-				if err := a.Store.Delete(ctx, chunk.RemoteFileID); err != nil {
-					return fmt.Errorf("drivepool: delete remote chunk %d: %w", chunk.Index, err)
-				}
+			a, ok := p.accounts[*chunk.AccountID]
+			if !ok || a.initErr != nil {
+				continue
+			}
+			// A chunk (or folder, below) deleted directly in Drive's own
+			// UI (outside this app) before the user clicked delete here is
+			// already in the state we want — treat that as success rather
+			// than blocking the rest of the purge and leaving the manifest
+			// row (and every other chunk) stuck undeleted forever.
+			if err := a.Store.Delete(ctx, chunk.RemoteFileID); err != nil && !errors.Is(err, gdrive.ErrNotFound) {
+				return fmt.Errorf("drivepool: delete remote chunk %d: %w", chunk.Index, err)
+			}
+			folders[*chunk.AccountID] = chunk.RemoteFolderID
+		}
+
+		// Drive has no separate "directory" type — a folder is just
+		// another file ID — so the same Delete call used for chunks above
+		// deletes a now-empty per-file folder too, instead of leaving it
+		// behind as clutter.
+		for accountID, folderID := range folders {
+			if err := p.accounts[accountID].Store.Delete(ctx, folderID); err != nil && !errors.Is(err, gdrive.ErrNotFound) {
+				return fmt.Errorf("drivepool: delete remote folder %s: %w", folderID, err)
 			}
 		}
 	}

@@ -30,17 +30,23 @@ type fakeStore struct {
 	limit      int64
 	usage      int64
 	files      map[string][]byte // remoteFileID -> ciphertext
+	folders    map[string]bool   // folderID -> exists — Drive has no separate folder type, just another file ID
 	next       int
 	failUpload bool // if true, Upload always errors — used to test partial-failure cleanup
 	deleted    []string
 }
 
 func newFakeStore(limit, usage int64) *fakeStore {
-	return &fakeStore{limit: limit, usage: usage, files: make(map[string][]byte)}
+	return &fakeStore{limit: limit, usage: usage, files: make(map[string][]byte), folders: make(map[string]bool)}
 }
 
 func (f *fakeStore) EnsureFolder(ctx context.Context, name string) (string, error) {
-	return "folder-" + name, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	id := "folder-" + name
+	f.folders[id] = true
+	return id, nil
 }
 
 func (f *fakeStore) Upload(ctx context.Context, name, folderID string, r io.ReaderAt, size int64) (string, string, error) {
@@ -76,9 +82,17 @@ func (f *fakeStore) Delete(ctx context.Context, remoteFileID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	delete(f.files, remoteFileID)
-	f.deleted = append(f.deleted, remoteFileID)
-	return nil
+	if _, ok := f.files[remoteFileID]; ok {
+		delete(f.files, remoteFileID)
+		f.deleted = append(f.deleted, remoteFileID)
+		return nil
+	}
+	if _, ok := f.folders[remoteFileID]; ok {
+		delete(f.folders, remoteFileID)
+		f.deleted = append(f.deleted, remoteFileID)
+		return nil
+	}
+	return fmt.Errorf("fakeStore: delete %q: %w", remoteFileID, gdrive.ErrNotFound)
 }
 
 func (f *fakeStore) Quota(ctx context.Context) (gdrive.QuotaInfo, error) {
@@ -234,6 +248,101 @@ func TestPutGetRoundTrip(t *testing.T) {
 	}
 	if len(files) != 0 {
 		t.Errorf("expected no files after tombstone remove, got %+v", files)
+	}
+}
+
+// TestRemovePurgeToleratesAlreadyDeletedRemoteChunk reproduces the bug
+// report: a chunk deleted directly in Drive's own UI (outside this app)
+// before the user also clicks delete here used to make the whole purge
+// fail with "not found" and leave the virtual file (and every other
+// chunk) stuck undeleted forever, even on retry. The remote delete call
+// failing with "already gone" should be treated the same as success.
+func TestRemovePurgeToleratesAlreadyDeletedRemoteChunk(t *testing.T) {
+	ctx := context.Background()
+	p, _ := newTestPool(t)
+	store := addFakeAccount(t, p, "acct-a", "a", 1<<30, 0)
+
+	srcPath := filepath.Join(t.TempDir(), "src.txt")
+	if err := os.WriteFile(srcPath, []byte("data manually removed from drive first"), 0o600); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+	if err := p.Put(ctx, srcPath, "docs/hello.txt"); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	vf, err := p.manifest.GetVirtualFile(ctx, p.userID, "docs/hello.txt")
+	if err != nil {
+		t.Fatalf("GetVirtualFile: %v", err)
+	}
+	chunks, err := p.manifest.ListChunks(ctx, p.userID, vf.ID)
+	if err != nil {
+		t.Fatalf("ListChunks: %v", err)
+	}
+	if len(chunks) != 1 {
+		t.Fatalf("want 1 chunk, got %d", len(chunks))
+	}
+
+	// Simulate the user deleting the chunk's file directly in Drive's own
+	// UI before ever clicking delete in this app.
+	if err := store.Delete(ctx, chunks[0].RemoteFileID); err != nil {
+		t.Fatalf("simulate manual drive deletion: %v", err)
+	}
+
+	if err := p.Remove(ctx, "docs/hello.txt", true); err != nil {
+		t.Fatalf("Remove(purge=true) should tolerate an already-deleted remote chunk, got: %v", err)
+	}
+
+	if _, err := p.manifest.GetVirtualFile(ctx, p.userID, "docs/hello.txt"); !errors.Is(err, manifest.ErrNotFound) {
+		t.Errorf("want the virtual file purged from the manifest, got err=%v", err)
+	}
+}
+
+// TestRemovePurgeDeletesTheRemoteFolderToo reproduces the bug report: purge
+// deleted each chunk's file but left the per-account folder it lived in
+// behind, empty — orphaned hashed-name folders accumulating on Drive with
+// every deleted file. Purge should remove the now-empty folder too.
+func TestRemovePurgeDeletesTheRemoteFolderToo(t *testing.T) {
+	ctx := context.Background()
+	p, _ := newTestPool(t)
+	store := addFakeAccount(t, p, "acct-a", "a", 1<<30, 0)
+
+	srcPath := filepath.Join(t.TempDir(), "src.txt")
+	if err := os.WriteFile(srcPath, []byte("data whose folder should be cleaned up too"), 0o600); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+	if err := p.Put(ctx, srcPath, "docs/hello.txt"); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	vf, err := p.manifest.GetVirtualFile(ctx, p.userID, "docs/hello.txt")
+	if err != nil {
+		t.Fatalf("GetVirtualFile: %v", err)
+	}
+	chunks, err := p.manifest.ListChunks(ctx, p.userID, vf.ID)
+	if err != nil {
+		t.Fatalf("ListChunks: %v", err)
+	}
+	if len(chunks) != 1 {
+		t.Fatalf("want 1 chunk, got %d", len(chunks))
+	}
+	folderID := chunks[0].RemoteFolderID
+
+	store.mu.Lock()
+	_, existsBefore := store.folders[folderID]
+	store.mu.Unlock()
+	if !existsBefore {
+		t.Fatalf("test setup: want folder %q to exist on the fake store before Remove", folderID)
+	}
+
+	if err := p.Remove(ctx, "docs/hello.txt", true); err != nil {
+		t.Fatalf("Remove(purge=true): %v", err)
+	}
+
+	store.mu.Lock()
+	_, existsAfter := store.folders[folderID]
+	store.mu.Unlock()
+	if existsAfter {
+		t.Errorf("want folder %q deleted along with its chunk, but it's still there", folderID)
 	}
 }
 

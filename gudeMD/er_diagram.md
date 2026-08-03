@@ -59,6 +59,8 @@ erDiagram
         BIGINT plaintext_size "not null, bytes"
         TEXT plaintext_sha256 "not null, per-chunk integrity check"
         TEXT ciphertext_md5 "not null, matched against Drive's own md5Checksum on upload"
+        TEXT compression_algo "not null, default 'none' — 'none' or 'flate'"
+        BIGINT compressed_size "not null, bytes actually encrypted/uploaded — equals plaintext_size when uncompressed"
         DATETIME uploaded_at "not null"
     }
 
@@ -126,6 +128,16 @@ just the schema.
   Nothing in the codebase writes to `chunk_replicas` yet — each chunk is
   placed on exactly one account today. Splitting/replicating across
   multiple accounts is tracked as Phase 3 in `tasks/modification_plan.md`.
+- **Chunk compression is transparent and per-chunk.** Before a chunk's
+  plaintext is encrypted (`drivepool.Pool.uploadChunk`), it's compressed
+  with raw DEFLATE (`storage.CompressBytes`) and the compressed form is
+  kept only if it's actually smaller — already-compressed content (media,
+  archives) is left as-is rather than paying a CPU cost for no space
+  savings. The decision is recorded per chunk in `compression_algo`/
+  `compressed_size`, so a single file's chunks can be a mix of compressed
+  and uncompressed. `plaintext_size`/`plaintext_sha256` always describe the
+  original, uncompressed bytes — unaffected by this. See
+  [`compression.md`](compression.md) for the full design.
 - **Content addressing**: `virtual_files.content_hash` is a SHA-256 of the
   whole plaintext file, checked once by `GetStream` after all chunks are
   reassembled; `chunks.plaintext_sha256` is the same idea per-chunk. This

@@ -20,6 +20,7 @@ See [README.md](README.md) for a full walkthrough of how the pieces fit together
 - **Streaming vs. discrete messages**: raw file bytes are never gob-encoded. A one-byte marker (`p2p.IncomingMessage` / `p2p.IncomingStream` in `p2p/message.go`) tells the TCP read loop whether to decode the next bytes as an `RPC` or treat them as a stream to hand off directly (see `TCPTransport.handleConn` and the `sync.WaitGroup`-based `peer.CloseStream()`/`wg.Wait()` handshake).
 - **Content addressing**: `storage.CASPathTransformFunc` (`storage/store.go`) — SHA-1 hash of the key, hex-encoded, split into 5-character directory segments. Don't bypass this with flat filenames when adding storage paths; use `PathTransformFunc` consistently. `drivepool` uses a SHA-256 content hash (not SHA-1) to name each file's remote Drive folder, since that hash also doubles as the integrity-check/future-dedup key — a stronger hash is warranted there.
 - **Encryption**: `storage.CopyEncrypt`/`storage.CopyDecrypt` (`storage/crypto.go`) — AES-256-CTR, random IV per call, IV prepended to ciphertext. `storage.HashKey` (MD5) is only for obfuscating storage keys on the wire, not a security boundary — don't repurpose it for anything security-sensitive. Both `server.go` (P2P) and `drivepool/pool.go` (Drive pooling) share this same pipeline via the `storage` package rather than each having their own copy.
+- **Compression**: `storage.CompressBytes`/`storage.DecompressBytes` (`storage/compress.go`) — raw DEFLATE (`compress/flate`, stdlib, no new dependency). Only `drivepool.Pool.uploadChunk` calls this today (not the P2P side): each chunk's plaintext is compressed *before* `CopyEncrypt`, and the compressed form is kept only if it's actually smaller (`chunks.compression_algo`/`compressed_size` record the per-chunk decision — `"none"` or `"flate"`). `downloadChunk` reverses it *after* `CopyDecrypt`, before the existing `PlaintextSHA256` check, which still verifies against the original uncompressed bytes. See `gudeMD/compression.md` for the full design and `gudeMD/er_diagram.md` for the schema.
 - **Concurrency**: peer map guarded by `sync.Mutex` (`FileServer.peerLock`); per-peer stream synchronization via `sync.WaitGroup`; RPCs delivered over a buffered channel (`Transport.Consume() <-chan RPC`). Keep new concurrent state behind an explicit mutex or channel rather than ad hoc synchronization. `drivepool.Manifest` wraps a shared `*gorm.DB` (see `db.Open`) — Postgres handles concurrent access natively, no `SetMaxOpenConns(1)`-style single-writer restriction like the old SQLite backend needed.
 - **Database**: one shared Postgres database (`DATABASE_URL`, e.g. Neon) for both the CLI and the web portal — no ORM-free/SQLite era left. Queries go through [GORM](https://gorm.io); schema changes are plain SQL files under `db/migrations/`, applied via [golang-migrate](https://github.com/golang-migrate/migrate) (`db.Migrate`, run at startup by both `rhino serve` and every CLI command) — **not** GORM's `AutoMigrate`, since the tenant-isolation constraints need to be reviewable in a SQL diff, not re-inferred from struct tags. Every per-user table (`accounts`, `virtual_files`, `chunks`, `chunk_replicas`) carries a `user_id` column; `drivepool/manifest/manifest.go`'s private `scoped(ctx, userID)` helper is the only sanctioned way any query is built — it panics on an empty `userID` rather than silently matching zero rows. See `gudeMD/er_diagram.md` for the full schema and rationale.
 - **Resource cleanup**: every `*os.File` opened for writing must be `defer f.Close()`'d — `storage.Store`'s `writeStream`/`WriteDecrypt` previously leaked write handles (harmless on Linux/Mac, but broke `Store.Delete`/`Clear` on Windows since it can't remove a file with an open handle); this has been fixed, so don't reintroduce the pattern.
@@ -39,7 +40,11 @@ storage/                Importable package — on-disk content-addressable stora
 ├── store.go              Store / StoreOpts, CASPathTransformFunc (SHA-1 path sharding), PathKey.
 ├── store_test.go         Tests: CAS path transform, write/read/has/delete round trip.
 ├── crypto.go             GenerateID, HashKey (MD5), NewEncryptionKey, CopyEncrypt/CopyDecrypt (AES-256-CTR).
-└── crypto_test.go        Test: encrypt -> decrypt round trip.
+├── crypto_test.go        Test: encrypt -> decrypt round trip.
+├── compress.go           CompressBytes/DecompressBytes (raw DEFLATE) + CompressionNone/CompressionFlate
+│                         constants. Only drivepool calls this today; lives here for the same reason
+│                         crypto.go does — shared package for both subsystems.
+└── compress_test.go      Test: compress -> decompress round trip (compressible/incompressible/empty).
                         Shared by both server.go (P2P) and drivepool/ (Drive pooling, in progress).
 
 p2p/
@@ -61,7 +66,7 @@ drivepool/              Google Drive multi-account pooling — core domain logic
 │                         (multi-chunk, to avoid a placement race across concurrent uploads).
 ├── bootstrap.go          DefaultClientSecretPath, OpenWithUser — wires OAuth client config +
 │                         an already-open manifest.Manifest into a Pool for a given userID.
-├── pool_test.go, account_test.go, chunking_test.go, fileinfo_test.go
+├── pool_test.go, account_test.go, chunking_test.go, fileinfo_test.go, compression_test.go
 │                         Tests against a fake in-memory RemoteStore (no real Drive/network
 │                         calls) and a real Postgres transaction (db/dbtest) — no SQLite fallback.
 ├── auth/

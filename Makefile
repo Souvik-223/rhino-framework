@@ -22,8 +22,7 @@ vet:
 build-frontend:
 	@npm --prefix frontend ci
 	@npm --prefix frontend run build
-	@rm -rf backend/dist
-	@cp -r frontend/dist backend/dist
+	@go run ./tools/copydist frontend/dist backend/dist
 
 build-portal: build-frontend
 	@go build -o bin/rhino ./cmd/rhino

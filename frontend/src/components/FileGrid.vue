@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref } from 'vue'
+import { toast } from 'vue-sonner'
 import { useFilesStore } from '../stores/files'
 import { api, type VirtualFile } from '../api/client'
 import { formatBytes } from '../composables/useBytes'
@@ -20,14 +21,40 @@ import { Download, Trash2, HardDrive, FileX, AlertCircle, AlertTriangle } from '
 
 const files = useFilesStore()
 const pendingDelete = ref<VirtualFile | null>(null)
+// AlertDialogAction has its own built-in "close the dialog" click handler
+// that runs before our forwarded @click on the same button (Vue calls a
+// component's own template listener before a fallthrough one) — that
+// closes the dialog and nulls pendingDelete via @update:open synchronously,
+// before confirmDelete even starts. deleteTarget is a second, independent
+// ref so the delete target survives that race.
+const deleteTarget = ref<VirtualFile | null>(null)
 
-function download(file: VirtualFile) {
-  window.location.href = api.downloadUrl(file.name)
+async function download(file: VirtualFile) {
+  try {
+    const blob = await api.downloadFile(file.name)
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = file.name
+    a.click()
+    URL.revokeObjectURL(url)
+    toast.success(`Downloaded "${file.name}"`)
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'download failed'
+    toast.error(`Failed to download "${file.name}"`, { description: message })
+  }
+}
+
+function openDeleteConfirm(file: VirtualFile) {
+  pendingDelete.value = file
+  deleteTarget.value = file
 }
 
 async function confirmDelete() {
-  if (!pendingDelete.value) return
-  await files.remove(pendingDelete.value.name)
+  const target = deleteTarget.value
+  if (!target) return
+  await files.remove(target.name)
+  deleteTarget.value = null
   pendingDelete.value = null
 }
 </script>
@@ -135,7 +162,7 @@ async function confirmDelete() {
                   size="icon"
                   class="size-8"
                   :disabled="f.degraded"
-                  :title="f.degraded ? 'Unavailable — reconnect the disconnected drive to restore access' : 'Download'"
+                  :title="f.degraded ? 'Unavailable. Reconnect the disconnected drive to restore access.' : 'Download'"
                   @click="download(f)"
                 >
                   <Download class="size-4" />
@@ -145,7 +172,7 @@ async function confirmDelete() {
                   size="icon"
                   class="text-destructive hover:text-destructive size-8"
                   title="Delete"
-                  @click="pendingDelete = f"
+                  @click="openDeleteConfirm(f)"
                 >
                   <Trash2 class="size-4" />
                 </Button>
@@ -161,7 +188,7 @@ async function confirmDelete() {
         <FileX class="text-muted-foreground size-6" />
       </div>
       <p class="text-muted-foreground text-sm">
-        No files yet — drag and drop one anywhere on this page to upload it.
+        No files yet. Drag and drop one anywhere on this page to upload it.
       </p>
     </div>
 
@@ -170,7 +197,7 @@ async function confirmDelete() {
         <AlertDialogHeader>
           <AlertDialogTitle>Delete "{{ pendingDelete?.name }}"?</AlertDialogTitle>
           <AlertDialogDescription>
-            This deletes the encrypted chunks from your Drive accounts too — this can't be
+            This deletes the encrypted chunks from your Drive accounts too. This can't be
             undone.
           </AlertDialogDescription>
         </AlertDialogHeader>

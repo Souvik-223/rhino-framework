@@ -107,7 +107,20 @@ export const api = {
       xhr.send(form)
     }),
 
-  downloadUrl: (name: string) => `/api/files/download?name=${encodeURIComponent(name)}`,
+  downloadFile: async (name: string) => {
+    const res = await fetch(`/api/files/download?name=${encodeURIComponent(name)}`, {
+      credentials: 'same-origin',
+    })
+    if (!res.ok) {
+      let message = res.statusText
+      try {
+        const body = await res.json()
+        if (body?.error) message = body.error
+      } catch {}
+      throw new ApiError(res.status, message)
+    }
+    return res.blob()
+  },
 
   deleteFile: (name: string, purge: boolean) =>
     request<void>(`/files?name=${encodeURIComponent(name)}&purge=${purge}`, {

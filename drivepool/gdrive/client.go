@@ -4,17 +4,32 @@ package gdrive
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 
 	"golang.org/x/oauth2"
 	"google.golang.org/api/drive/v3"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/option"
 )
 
 // DriveFileScope grants access only to files/folders this application
 // itself creates — it never sees the user's pre-existing Drive content.
 const DriveFileScope = drive.DriveFileScope
+
+// ErrNotFound wraps a Drive API 404: the remote file/folder a caller asked
+// about no longer exists — most commonly because it was deleted directly
+// in Drive's own UI, outside this app. Callers can check for it with
+// errors.Is to tell "already gone" apart from a real failure (see
+// drivepool.Pool.Remove's purge path).
+var ErrNotFound = errors.New("gdrive: not found")
+
+func isNotFoundErr(err error) bool {
+	var gerr *googleapi.Error
+	return errors.As(err, &gerr) && gerr.Code == http.StatusNotFound
+}
 
 // QuotaInfo reports an account's Drive-wide storage quota. Limit/Usage are
 // bytes; Unlimited is true for Workspace accounts where Drive reports no
@@ -134,6 +149,9 @@ func (c *Client) Download(ctx context.Context, remoteFileID string) (io.ReadClos
 
 func (c *Client) Delete(ctx context.Context, remoteFileID string) error {
 	if err := c.srv.Files.Delete(remoteFileID).Context(ctx).Do(); err != nil {
+		if isNotFoundErr(err) {
+			return fmt.Errorf("gdrive: delete %q: %w", remoteFileID, ErrNotFound)
+		}
 		return fmt.Errorf("gdrive: delete %q: %w", remoteFileID, err)
 	}
 	return nil

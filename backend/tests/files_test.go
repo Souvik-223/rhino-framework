@@ -6,6 +6,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -123,7 +124,17 @@ func TestDownloadMissingFile(t *testing.T) {
 		t.Fatalf("download: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusOK {
-		t.Fatalf("want a non-200 status for a missing file, got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404 for a missing file, got %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("want a JSON error body, got Content-Type %q", ct)
+	}
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	if body["error"] != "file not found" {
+		t.Errorf("want error message %q, got %+v", "file not found", body)
 	}
 }
