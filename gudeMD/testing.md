@@ -82,7 +82,7 @@ go test ./storage/... ./p2p/... -v  # just the P2P side
 | --- | --- |
 | `storage` | CAS path-sharding (`store_test.go`), write/read/has/delete round trip, AES-256-CTR encrypt→decrypt round trip (`crypto_test.go`), DEFLATE compress→decompress round trip for compressible/incompressible/empty input (`compress_test.go`) |
 | `p2p` | `TCPTransport` dial/accept smoke test |
-| `drivepool` (`pool_test.go`) | Placement (`pickAccount` picks the most-free healthy account, skips unhealthy ones, errors when none are healthy), full `Put`/`Get` round trip against a fake in-memory Drive account, account-removal guard (`ErrAccountInUse`/`force`), and `TestPoolsAreTenantIsolated` — two `Pool`s scoped to different users never see each other's accounts/files |
+| `drivepool` (`pool_test.go`) | Placement (`pickAccount` picks the most-free healthy account, skips unhealthy ones, errors when none are healthy), full `Put`/`Get` round trip against a fake in-memory Drive account, account-removal guard (`ErrAccountInUse`/`force`), `TestPoolsAreTenantIsolated` — two `Pool`s scoped to different users never see each other's accounts/files, `TestRemovePurgeToleratesAlreadyDeletedRemoteChunk` — a chunk deleted directly in Drive's own UI before the app tries to delete it doesn't block the rest of the purge, and `TestRemovePurgeDeletesTheRemoteFolderToo` — purge deletes each account's now-empty per-file folder, not just the chunk files inside it |
 | `drivepool` (`chunking_test.go`) | A file larger than `ChunkSize` actually splits into multiple chunks; those chunks land on **different** accounts (not all on one); a mid-upload chunk failure triggers best-effort cleanup of the chunks that *did* upload, and leaves no manifest record; a chunk whose stored ciphertext is tampered with post-upload is detected and `GetStream` fails rather than silently returning corrupted data |
 | `drivepool` (`compression_test.go`) | Highly compressible chunk data is actually stored compressed (`CompressionAlgo == "flate"`, `CompressedSize < PlaintextSize`) and round-trips correctly; random/incompressible data is stored uncompressed (`CompressionAlgo == "none"`) and still round-trips; a chunk row with `CompressionAlgo` left at its Go zero value (simulating data from before this feature existed) is read back unmodified, with no decompression attempted — see `compression.md` |
 | `drivepool/manifest` (`manifest_test.go`) | Token encrypt/decrypt round trip, tenant isolation and per-user `UNIQUE(user_id, name/label)` on accounts and virtual files, `ON DELETE CASCADE` (chunks with their virtual file) and `ON DELETE SET NULL` (chunks when their account is removed), `CountActiveChunks` excluding soft-deleted files |
@@ -256,10 +256,12 @@ make run-portal         # then: ./bin/rhino serve
 # raw commands, if make isn't available:
 npm --prefix frontend ci
 npm --prefix frontend run build
-rm -rf backend/dist && cp -r frontend/dist backend/dist
+go run ./tools/copydist frontend/dist backend/dist
 go build -o bin/rhino ./cmd/rhino
 ./bin/rhino serve
 ```
+
+The copy step used to be `rm -rf backend/dist && cp -r frontend/dist backend/dist` — that broke when `make` was invoked from plain Windows `cmd.exe`/PowerShell (no `rm`/`cp` there; only git-bash/WSL had them). `tools/copydist` is a tiny portable Go program that does the same thing via `go run`, which works identically no matter which shell invoked it.
 
 Open `http://localhost:8080/` — you should get the **real Vue app**, not the
 placeholder page. (If you see a plain "Placeholder —" page, the copy step
@@ -280,8 +282,12 @@ Needs `client_secret.json` in place for the account-connect and file steps
    (progress bar in the file list) as soon as you drop it.
 5. Click **Download** on the uploaded file — it should download with its
    original name and byte-identical content.
-6. Click **Delete** — a confirm dialog offers purge (delete remote chunks
-   too) vs. keep; either way the row disappears from the list.
+6. Click **Delete** — a confirm dialog warns that it deletes the encrypted
+   chunks from your Drive accounts too and can't be undone; confirming
+   removes the row from the list. Unlike the CLI's `rm` (which defaults to
+   a soft delete, keeping the remote chunks unless you pass `--purge`), the
+   portal's delete always purges — there's no "keep the remote copy" option
+   in the UI.
 7. Click **Log out**, then reload `/` — you should be redirected to
    `/login`, not shown the dashboard.
 
@@ -433,12 +439,14 @@ version and `latest`.
 | Partial-upload-failure cleanup | `go test ./drivepool/...` (`TestPutStreamFailureCleansUpUploadedChunks`) — hard to trigger manually on purpose |
 | Tampered-chunk detection | `go test ./drivepool/...` (`TestGetStreamDetectsTamperedChunk`) |
 | Per-chunk compression (compress-if-smaller, transparent decompression) | `go test ./storage/... ./drivepool/...` (`compress_test.go`, `compression_test.go`) — see `compression.md` |
+| Purge tolerates a chunk already deleted directly in Drive | `go test ./drivepool/...` (`TestRemovePurgeToleratesAlreadyDeletedRemoteChunk`) |
+| Purge deletes the now-empty per-account folder, not just the chunk files | `go test ./drivepool/...` (`TestRemovePurgeDeletesTheRemoteFolderToo`) |
 | Graceful degradation (one bad account doesn't break others) | Revoke one account's token/consent in your Google account settings, then confirm other commands still work and only that account reports "unavailable" |
 | Portal registration/login/logout/session enforcement | §6.3 or §6.5, or `go test ./backend/...` |
 | Multi-tenant isolation (web portal, session-based) | §6.4 |
 | Multi-tenant isolation (database level — every table's `user_id` scoping) | `go test ./drivepool/...` (`TestPoolsAreTenantIsolated`) and `./drivepool/manifest/...` (`TestAccountsAreTenantIsolated`, `TestVirtualFilesAreTenantIsolatedAndPerUserUnique`) |
 | Drag-and-drop upload + file-picker fallback | §6.3 (browser), or `npm run test` (`DropZone.test.ts`) |
-| Download / delete (with purge option) | §6.3 or §6.5 |
+| Download / delete (portal always purges; CLI's `rm` defaults to soft delete, `--purge` opts in) | §6.3 or §6.5 |
 | Usage bars / thresholds (green/amber/red) | §6.3 (browser) or `npm run test` (`useBytes.test.ts`) |
 | `/healthz` / `/readyz` | §6.5, or `docker compose`'s health checks |
 | Graceful shutdown on SIGTERM | §7 |

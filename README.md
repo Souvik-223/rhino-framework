@@ -133,12 +133,18 @@ cmd/rhino/
 └── serve.go                `rhino serve` — runs the web portal; graceful shutdown on
                             SIGINT/SIGTERM via signal.NotifyContext + http.Server.Shutdown.
 
+tools/copydist/          go run-able helper that copies frontend/dist -> backend/dist for
+                        `make build-frontend` — portable across shells (plain cmd.exe/
+                        PowerShell included), unlike the `rm -rf`/`cp -r` it replaced.
+
 bin/fs                  Build output of `make build` (currently checked into git).
 Makefile                 build / run / test / vet / build-rhino / run-rhino /
                         build-frontend / build-portal / run-portal targets.
 go.mod / go.sum          Module github.com/Souvik-223/rhino-framework, Go 1.25.
 Dockerfile / docker-compose.yml / Caddyfile   Container build + reverse-proxy deployment
                         for the portal — see "Web portal" → "Deploying" below.
+render.yaml              Render.com Blueprint — deploys the same Dockerfile as a free-tier
+                        web service, no Caddy/reverse-proxy needed (Render terminates TLS).
 ```
 
 ## Requirements
@@ -241,7 +247,7 @@ The key wiring detail is `tr.OnPeer = s.OnPeer` — without it, new connections 
 
 ## Google Drive pooling (`rhino` CLI)
 
-`drivepool` treats N registered Google Drive accounts as one pool: `rhino put` encrypts a file with AES-256-CTR (via the same `storage.CopyEncrypt` used by the P2P side), splits it into fixed-size chunks, and uploads each chunk — concurrently, entirely from memory, no local temp file — to whichever registered account currently has the most free space at that moment. `rhino get` reverses this: downloads and decrypts each chunk concurrently (verifying it against its own recorded hash), reassembling them in the correct order, then verifies the whole plaintext against a SHA-256 content hash recorded at upload time. Everything is tracked in a shared Postgres database (`accounts` / `virtual_files` / `chunks` tables, via GORM — see `db/`) so `rhino ls`/`status` can report on the pool without touching the network, and so the same data is visible whether you access it from the CLI or the web portal.
+`drivepool` treats N registered Google Drive accounts as one pool: `rhino put` splits a file into fixed-size chunks, tries compressing each one with DEFLATE and keeps the compressed form only if it's actually smaller (already-compressed media just stays as-is — see `gudeMD/compression.md`), encrypts it with AES-256-CTR (via the same `storage.CopyEncrypt` used by the P2P side), and uploads each chunk — concurrently, entirely from memory, no local temp file — to whichever registered account currently has the most free space at that moment. `rhino get` reverses this: downloads and decrypts each chunk concurrently (decompressing it first if it was compressed, then verifying it against its own recorded hash), reassembling them in the correct order, then verifies the whole plaintext against a SHA-256 content hash recorded at upload time. Everything is tracked in a shared Postgres database (`accounts` / `virtual_files` / `chunks` tables, via GORM — see `db/`) so `rhino ls`/`status` can report on the pool without touching the network, and so the same data is visible whether you access it from the CLI or the web portal.
 
 **Not yet implemented:** chunk replication (storing a chunk on more than one account for redundancy — the `chunk_replicas` table exists in the schema but isn't populated yet), dedup, and versioning.
 
@@ -313,9 +319,13 @@ Key environment variables (see `.env.example` for the full list):
 | `RHINO_TOKEN_ENCRYPTION_KEY` / `RHINO_TOKEN_ENCRYPTION_KEY_FILE` | 32 bytes, hex-encoded — encrypts every stored OAuth token at rest. Required. |
 | `RHINO_ADDR` | Address to listen on (default `:8080`); `--addr` overrides. |
 | `RHINO_SESSION_SECRET` / `RHINO_SESSION_SECRET_FILE` | Signs session cookies. Without one, a random key is generated at startup and every session is invalidated on restart — **set this in production**. |
+| `RHINO_SESSION_SECURE` | Set to `1` whenever the browser reaches this deployment over HTTPS — whether TLS is terminated by this process itself or by something in front of it (Caddy, Render, any reverse proxy). Controls the session cookie's `Secure` flag. Leave unset for plain-HTTP local dev. |
+| `RHINO_PUBLIC_URL` | This deployment's externally-reachable base URL (e.g. `https://your-app.onrender.com`). Defaults to `http://localhost:8080`. Used to build the Google OAuth redirect URL (`{RHINO_PUBLIC_URL}/api/accounts/oauth/callback`) — must match a redirect URI registered on a **Web application**-type OAuth client in Google Cloud Console. |
 | `RHINO_CLIENT_SECRET` | Overrides where `client_secret.json` is read from. |
 
 ### Deploying
+
+**Option A — your own server, via Docker Compose + Caddy:**
 
 ```bash
 cp .env.example .env                          # fill in real values
@@ -329,6 +339,14 @@ docker compose up -d --build
 ```
 
 `docker-compose.yml` runs the portal behind a `Caddy` reverse proxy that terminates TLS automatically (edit the placeholder domain in `Caddyfile` first). All durable state — every user's accounts/files/chunks, and the portal's login accounts — lives in the external Postgres database (`DATABASE_URL`), not on a local volume; there's nothing to back up on the host itself beyond `client_secret.json`. `/healthz` (liveness) and `/readyz` (readiness, checks the database connection) are available for a load balancer or orchestrator.
+
+**Option B — free-tier hosting, via Render:** `render.yaml` deploys the same `Dockerfile` as a Render Web Service, no server/reverse-proxy of your own needed — Render terminates TLS at its edge. Connect this repo on [render.com](https://render.com) (it auto-detects `render.yaml`), then set these once in the dashboard:
+
+- `DATABASE_URL`, `RHINO_TOKEN_ENCRYPTION_KEY`, `RHINO_SESSION_SECRET` — declared in `render.yaml` as required, filled in via the dashboard (never committed).
+- The OAuth `client_secret.json` content — dashboard → Environment → **Secret Files**, path `/etc/secrets/client_secret.json` (already where `RHINO_CLIENT_SECRET` points in `render.yaml`). Needs to be a **Web application**-type OAuth client, not the CLI's Desktop one.
+- `RHINO_PUBLIC_URL` — set to `https://<your-service>.onrender.com` once Render assigns it after the first deploy, then register `https://<your-service>.onrender.com/api/accounts/oauth/callback` as that OAuth client's redirect URI in Google Cloud Console.
+
+Render's free tier has no time limit and needs no card, but a free web service sleeps after 15 minutes idle (~30-60s cold start on the next request) — fine for a personal/hobby deployment, not for something that needs to always be instantly responsive.
 
 ### Testing without real Google credentials
 

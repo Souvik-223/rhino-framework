@@ -3,6 +3,10 @@ services:
     build: .
     environment:
       - RHINO_ADDR=:8080
+      # Caddy terminates TLS in front of this container — the browser only
+      # ever sees https://, so the session cookie's Secure flag should be
+      # on even though rhino itself speaks plain HTTP internally.
+      - RHINO_SESSION_SECURE=1
       - RHINO_SESSION_SECRET_FILE=/run/secrets/session_secret
       - DATABASE_URL_FILE=/run/secrets/database_url
       - RHINO_TOKEN_ENCRYPTION_KEY_FILE=/run/secrets/token_encryption_key
