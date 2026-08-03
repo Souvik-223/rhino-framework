@@ -11,6 +11,10 @@ export const useAccountsStore = defineStore('accounts', () => {
     loading.value = true
     try {
       accounts.value = await api.listAccounts()
+    } catch (err) {
+      toast.error('Failed to load accounts', {
+        description: err instanceof Error ? err.message : 'unknown error',
+      })
     } finally {
       loading.value = false
     }
